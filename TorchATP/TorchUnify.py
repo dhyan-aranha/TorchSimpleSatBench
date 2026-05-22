@@ -232,16 +232,6 @@ class SingleUnifierWrapper:
 class NeuralProverPipeline:
     """
     This class includes both pre- and pos-processing for our batches of claues. 
-
-    1) standardize apart: For now, this can be safely ignored. I added it because in the future we might want to give clauses
-    fresh variables when we run Robinson's saturation algorithm. The default you should use is standrize_apart = False. Indeed this 
-    is what Stephan Schulz does in PyRes and only deals with creating fresh variables in the resolution algorithm. 
-
-    2) decode term : The raw subsitition tensor for X -> f(Y) would look like [1, 1, 2] in particular it just tells us that X goes to f
-    but really X goes to the full term: we need to combine this with the knoweldge of the 
-    children tensor. Decode term takes care of this and from [1, 1, 2] + Children reconstructs the subsitution in natural language. 
-
-     
     """
     def __init__(self, max_arity=2, device='cpu'):
         self.parser = LogicParser(max_arity=max_arity)
@@ -317,7 +307,9 @@ class NeuralProverPipeline:
     
 
     def instantiate_in_arena(self, root_indices, exclude_idx, unifier):
+
         valid_roots = [r for i, r in enumerate(root_indices) if i != exclude_idx]
+        
         if not valid_roots:
             return []
 

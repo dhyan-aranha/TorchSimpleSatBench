@@ -158,7 +158,7 @@ class Lexer(object):
         (re.compile(r"'[^']*'"),               Token.SQString)
         ]
 
-    def __init__(self, source):
+    def __init__(self, source, name="user string"):
         """
         Initialize the lexer with the string (=sequence of bytes) to
         be split into tokens. The second argument can be used to
@@ -167,6 +167,7 @@ class Lexer(object):
         self.token_stack = []
         self.source = source
         self.pos = 0
+        self.name = name
        
 
     def getName(self):

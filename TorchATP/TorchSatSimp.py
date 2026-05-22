@@ -5,7 +5,7 @@ from derivations import Derivation, flatDerivation
 from TorchClauses import Clause, VirtualClause, decode_virtual_clause, Literal, parse_tptp_to_virtual_clause
 
 logging.basicConfig(
-    level=logging.DEBUG, # Change this to logging.INFO when benchmarking!
+    level=logging.INFO, # Change this to logging.INFO when benchmarking!
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -228,7 +228,7 @@ def run_given_clause_benchmark_tensor(tptp_strings, pipeline, max_loops=2000):
                 logger.info(f"Total clauses generated: {total_clauses_generated}")
                 
                 # The proof is found, so we ALWAYS decode the final lineage
-                print("\n=== HUMAN READABLE PROOF PATH ===")
+                print("\n---PROOF PATH ---")
                 proof_path = res.orderedDerivation()
                 for step in proof_path:
                     # You might need to attach the decoded string to the __repr__ of the 
