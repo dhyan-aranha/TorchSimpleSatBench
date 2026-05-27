@@ -164,25 +164,12 @@ class BatchedGPUUnifier:
                 s_t = process_t[survivors]
                 s_b = process_b[survivors]
                 
-                # 2. CHECK IF ALREADY BOUND (Conflict Check)
+                # 2. WRITE SUBSTITUTIONS (Conflict Check Removed!)
+                # Because of update_ref and sequential deferral, s_v is guaranteed 
+                # to be unbound and unique to this wave. We just write it directly!
                 if s_v.shape[0] > 0:
-                    old_targets = self.subs[s_b, s_v]
-                    is_unbound = (old_targets == s_v)
-                    
-                    # If unbound, safely write the substitution
-                    write_mask = is_unbound
-                    if torch.any(write_mask):
-                        self.subs[s_b[write_mask], s_v[write_mask]] = s_t[write_mask]
-                        
-                    # If already bound, DO NOT overwrite! Push the equation to the frontier!
-                    conflict_mask = ~is_unbound
-                    if torch.any(conflict_mask):
-                        c_left = old_targets[conflict_mask]
-                        c_right = s_t[conflict_mask]
-                        c_batch = s_b[conflict_mask]
-                        next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                        next_batch_pieces.append(c_batch)
-                    
+                    self.subs[s_b, s_v] = s_t
+                
             # --- HANDLE FUNCTION/CONSTANT SYMBOLS ---
             fun_mask = ~is_var_pair
             if torch.any(fun_mask):
