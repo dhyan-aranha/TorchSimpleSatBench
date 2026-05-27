@@ -1,6 +1,6 @@
 import torch
 import re
-import TorchUnify
+import TorchUnifyPlus
 from derivations import Derivable, flatDerivation
 from lexer import Lexer
 
@@ -81,7 +81,7 @@ def decode_virtual_clause(v_clause, pipeline):
     # --- THE FIX ---
     # Create a blank unifier wrapped around the global memory arena
     # so decode_term has access to update_ref and the tensor arrays.
-    dummy_unifier = TorchUnify.BatchedGPUUnifier(
+    dummy_unifier = TorchUnifyPlus.BatchedGPUUnifier(
         pipeline.parser.nodes, 
         pipeline.parser.children, 
         pipeline.parser.is_var_mask, 
@@ -128,12 +128,16 @@ def parse_tptp_string(tptp_str):
 
 def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     """
-    Parses a TPTP string and loads its terms directly into the TorchParse memory arena (
-    this is a side effect!) Returns a VirtualClause containing tuples of (is_negative_bool, root_index_int).
+    Parses a TPTP string and loads its terms directly into the TorchParse memory arena.
+    Returns a VirtualClause containing tuples of (is_negative_bool, root_index_int).
     Safely toggles between List and Tensor states to prevent GPU pipeline crashes.
     """
     # 1. Extract the name and the literal block
     match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*\((.*)\)\s*\)\.?", tptp_str.strip())
+    if not match:
+        # Fallback if it lacks the outer parens: cnf(name, role, INNER).
+        match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*(.*)\)\.?", tptp_str.strip())
+        
     if not match:
         raise ValueError(f"Could not parse TPTP string: {tptp_str}")
         
@@ -147,36 +151,68 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     local_vars = {}
     virtual_literals = []
     
-    #  State-Saver for PyTorch Tensors
+    # --- PRE-PARSE EXTRACTION BLOCK: State-Saver for PyTorch Tensors ---
     was_tensor = False
     device = 'cpu'
     if isinstance(pipeline.parser.nodes, torch.Tensor):
         was_tensor = True
         device = pipeline.parser.nodes.device
-        pipeline.parser.nodes = pipeline.parser.nodes.tolist()
-        pipeline.parser.children = pipeline.parser.children.tolist()
-        pipeline.parser.is_var_mask = pipeline.parser.is_var_mask.tolist()
+        ptr = pipeline.parser.arena_ptr
+        
+        # 1. Save references to the massive 5M tensors so we don't delete them!
+        saved_nodes_tensor = pipeline.parser.nodes
+        saved_children_tensor = pipeline.parser.children
+        saved_mask_tensor = pipeline.parser.is_var_mask
+        
+        # 2. Extract ONLY the active data slice and convert to fast Python lists
+        pipeline.parser.nodes = saved_nodes_tensor[:ptr].tolist()
+        pipeline.parser.children = saved_children_tensor[:ptr].tolist()
+        pipeline.parser.is_var_mask = saved_mask_tensor[:ptr].tolist()
+    # -------------------------------------------------------------------
 
+    # 3. Parse each literal into the continuous global arena
     for raw_lit in raw_literals:
         raw_lit = raw_lit.strip()
         
-        # 3. Extract and strip the polarity
+        # Extract and strip the polarity
         is_neg = raw_lit.startswith('~')
         atom_str = raw_lit[1:] if is_neg else raw_lit
         atom_str = atom_str.strip()
         
-        # 4. Parse the pure positive atom into the memory arena
+        # Parse the pure positive atom into the memory arena
         lexer = Lexer(atom_str)
         root_idx = pipeline.parser._parse_term(lexer, local_vars)
         
-        # 5. Save as a tuple
+        # Save as a tuple
         virtual_literals.append((is_neg, root_idx))
         
-    # --- RESTORE THE ARENA: If it was a GPU tensor, push the new nodes to VRAM ---
+    # --- POST-PARSE RESTORATION BLOCK: Push delta back to 5M VRAM buffer ---
     if was_tensor:
-        pipeline.parser.nodes = torch.tensor(pipeline.parser.nodes, dtype=torch.long, device=device)
-        pipeline.parser.children = torch.tensor(pipeline.parser.children, dtype=torch.long, device=device)
-        pipeline.parser.is_var_mask = torch.tensor(pipeline.parser.is_var_mask, dtype=torch.bool, device=device)
+        new_len = len(pipeline.parser.nodes)
+        num_new = new_len - ptr
+        
+        if num_new > 0:
+            if ptr + num_new > saved_nodes_tensor.shape[0]:
+                raise MemoryError("VRAM Arena Capacity Exceeded during parsing!")
+                
+            # 1. Extract ONLY the newly appended items from the lists
+            new_nodes = torch.tensor(pipeline.parser.nodes[ptr:], dtype=torch.long, device=device)
+            new_children = torch.tensor(pipeline.parser.children[ptr:], dtype=torch.long, device=device)
+            new_mask = torch.tensor(pipeline.parser.is_var_mask[ptr:], dtype=torch.bool, device=device)
+            
+            # 2. Write them directly into the empty space of the 5M VRAM buffer
+            saved_nodes_tensor[ptr : ptr + num_new] = new_nodes
+            saved_children_tensor[ptr : ptr + num_new] = new_children
+            saved_mask_tensor[ptr : ptr + num_new] = new_mask
+            
+            # 3. Update the global pointer
+            pipeline.parser.arena_ptr += num_new
+            
+        # 4. Restore the pipeline to use the massive tensors again
+        pipeline.parser.nodes = saved_nodes_tensor
+        pipeline.parser.children = saved_children_tensor
+        pipeline.parser.is_var_mask = saved_mask_tensor
+    # -----------------------------------------------------------------------
         
     # Save the clause's variable map into the pipeline's history for debugging
     pipeline.parser.var_maps.append(local_vars)

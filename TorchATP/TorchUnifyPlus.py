@@ -1,6 +1,6 @@
 import torch
 import math
-from TorchParse import LogicParser
+from TorchParserPlus import LogicParser
 
 class BatchedGPUUnifier:
     def __init__(self, nodes, children, is_var_mask, max_arity):
@@ -296,13 +296,18 @@ class NeuralProverPipeline:
         # Convert the list of tuples into a [Batch_Size, 2] PyTorch tensor
         pair_batch = torch.tensor(pair_indices, dtype=torch.long, device=self.device)
         
-        # We instantiate the unifier using the parser's GLOBAL memory arena!
+        # Convert the list of tuples into a [Batch_Size, 2] PyTorch tensor
+        pair_batch = torch.tensor(pair_indices, dtype=torch.long, device=self.device)
+        
+        # --- THE FIX: Slice the arena up to the active pointer! ---
+        ptr = self.parser.arena_ptr
         unifier = BatchedGPUUnifier(
-            self.parser.nodes, 
-            self.parser.children, 
-            self.parser.is_var_mask, 
+            self.parser.nodes[:ptr], 
+            self.parser.children[:ptr], 
+            self.parser.is_var_mask[:ptr], 
             max_arity=self.parser.max_arity
         )
+        # ----------------------------------------------------------
         
         subs, success_mask = unifier.unify(pair_batch)
         
@@ -390,7 +395,7 @@ class NeuralProverPipeline:
         if batched_requests.shape[0] == 0:
             return []
 
-        current_arena_size = self.parser.nodes.shape[0]
+        current_arena_size = self.parser.arena_ptr
         num_batches = unifier.subs.shape[0]
         
         # 1. THE 2D MEMOIZATION TABLE (Flattened for VRAM safety)
@@ -476,15 +481,30 @@ class NeuralProverPipeline:
             out_is_var.append(level_is_var)
             out_children.append(new_level_children)
             
-        # 6. PUSH TO GLOBAL ARENA
+        # 6. PUSH TO GLOBAL ARENA (Zero-Copy VRAM Write)
         if out_nodes:
-            self.parser.nodes = torch.cat([self.parser.nodes] + out_nodes)
-            self.parser.is_var_mask = torch.cat([self.parser.is_var_mask] + out_is_var)
-            self.parser.children = torch.cat([self.parser.children] + out_children)
+            # Flatten the multi-wave BFS arrays
+            flat_nodes = torch.cat(out_nodes)
+            flat_is_var = torch.cat(out_is_var)
+            flat_children = torch.cat(out_children)
+            
+            num_new = flat_nodes.shape[0]
+            ptr = self.parser.arena_ptr
+            
+            if ptr + num_new > self.parser.nodes.shape[0]:
+                raise MemoryError("VRAM Arena Capacity Exceeded! Increase CAPACITY in Tensor Transition.")
+                
+            # Write directly into the empty space at the bottom of the buffer
+            self.parser.nodes[ptr : ptr + num_new] = flat_nodes
+            self.parser.is_var_mask[ptr : ptr + num_new] = flat_is_var
+            self.parser.children[ptr : ptr + num_new] = flat_children
+            
+            # Move the global memory pointer down
+            self.parser.arena_ptr += num_new
             
         # 7. RETURN NEW ROOTS 
-        # Map the original requests back to their newly allocated root indices
         return old_to_new[root_keys]
+        
     
     def decode_term(self, idx, unifier, id_to_symbol, var_name_map, visited=None):
         if visited is None:
