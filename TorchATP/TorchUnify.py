@@ -83,6 +83,7 @@ class BatchedGPUUnifier:
         """
         Iterative, batched unification loop.
         Allocates a clean 2D [num_pairs, num_nodes] substitution matrix per run.
+        Applies Sequential Deferral via high-speed scatter to prevent intra-batch cycles.
         """
         num_pairs = pair_batch.shape[0]
 
@@ -118,70 +119,76 @@ class BatchedGPUUnifier:
             next_frontier_pieces = []
             next_batch_pieces = []
             
-            # --- Bind Variables on LEFT ---
-            if torch.any(l_is_v):
-                v_idx, t_idx = left[l_is_v], right[l_is_v]
-                b_idx = batch_idx[l_is_v]
+            # --- CONSOLIDATED VARIABLE BINDING ---
+            is_var_pair = l_is_v | r_is_v
+            
+            if torch.any(is_var_pair):
+                v_left = left[is_var_pair]
+                v_right = right[is_var_pair]
+                v_l_is_v = l_is_v[is_var_pair]
                 
-                failed_occurs = self.occurs_check(v_idx, t_idx, b_idx)
-
+                # Consolidate so `v_idx` is ALWAYS the variable, `t_idx` is the target
+                v_idx = torch.where(v_l_is_v, v_left, v_right)
+                t_idx = torch.where(v_l_is_v, v_right, v_left)
+                b_idx_all = batch_idx[is_var_pair]
+                
+                # --- FAST INTRA-BATCH DEFERRAL (THE FIX) ---
+                # We extract the unique realities currently processing variables
+                unique_b, inverse_indices = torch.unique(b_idx_all, return_inverse=True)
+                idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
+                
+                # Use scatter to isolate exactly ONE equation per reality in O(N) time
+                first_occ_idx = torch.zeros(len(unique_b), dtype=torch.long, device=self.nodes.device)
+                first_occ_idx.scatter_(0, inverse_indices.flip(0), idx_seq.flip(0))
+                
+                process_v = v_idx[first_occ_idx]
+                process_t = t_idx[first_occ_idx]
+                process_b = b_idx_all[first_occ_idx]
+                
+                # Defer the remaining duplicates safely to the next wave
+                deferred_mask = torch.ones(len(b_idx_all), dtype=torch.bool, device=self.nodes.device)
+                deferred_mask[first_occ_idx] = False
+                
+                if torch.any(deferred_mask):
+                    next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
+                    next_batch_pieces.append(b_idx_all[deferred_mask])
+                    
+                # 1. OCCURS CHECK
+                failed_occurs = self.occurs_check(process_v, process_t, process_b)
+                
                 if torch.any(failed_occurs):
-                    success_mask[b_idx[failed_occurs]] = False
-                
-                survivors = ~failed_occurs
-                v_surv, t_surv = v_idx[survivors], t_idx[survivors]
-                b_surv = b_idx[survivors]
-                
-                # 2D ASSIGNMENT
-                self.subs[b_surv, v_surv] = t_surv
-                
-                # 2D CONFLICT CHECK
-                won_targets = self.subs[b_surv, v_surv]
-                conflict_mask = (won_targets != t_surv)
-                
-                if torch.any(conflict_mask):
-                    c_left = won_targets[conflict_mask]
-                    c_right = t_surv[conflict_mask]
-                    c_batch = b_surv[conflict_mask]
-                    next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                    next_batch_pieces.append(c_batch)
-                
-            # --- Bind Variables on RIGHT ---
-            r_bind_mask = r_is_v & ~l_is_v
-        
-            if torch.any(r_bind_mask):
-                v_idx, t_idx = right[r_bind_mask], left[r_bind_mask]
-                b_idx = batch_idx[r_bind_mask]
-                
-                failed_occurs = self.occurs_check(v_idx, t_idx, b_idx)
-                
-                if torch.any(failed_occurs):
-                    success_mask[b_idx[failed_occurs]] = False
+                    success_mask[process_b[failed_occurs]] = False
                     
                 survivors = ~failed_occurs
-                v_surv, t_surv = v_idx[survivors], t_idx[survivors]
-                b_surv = b_idx[survivors]
+                s_v = process_v[survivors]
+                s_t = process_t[survivors]
+                s_b = process_b[survivors]
                 
-                # 2D ASSIGNMENT
-                self.subs[b_surv, v_surv] = t_surv
+                # 2. CHECK IF ALREADY BOUND (Conflict Check)
+                if s_v.shape[0] > 0:
+                    old_targets = self.subs[s_b, s_v]
+                    is_unbound = (old_targets == s_v)
+                    
+                    # If unbound, safely write the substitution
+                    write_mask = is_unbound
+                    if torch.any(write_mask):
+                        self.subs[s_b[write_mask], s_v[write_mask]] = s_t[write_mask]
+                        
+                    # If already bound, DO NOT overwrite! Push the equation to the frontier!
+                    conflict_mask = ~is_unbound
+                    if torch.any(conflict_mask):
+                        c_left = old_targets[conflict_mask]
+                        c_right = s_t[conflict_mask]
+                        c_batch = s_b[conflict_mask]
+                        next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
+                        next_batch_pieces.append(c_batch)
+                    
+            # --- HANDLE FUNCTION/CONSTANT SYMBOLS ---
+            fun_mask = ~is_var_pair
+            if torch.any(fun_mask):
+                f_left, f_right = left[fun_mask], right[fun_mask]
+                f_batch = batch_idx[fun_mask]
                 
-                # 2D CONFLICT CHECK
-                won_targets = self.subs[b_surv, v_surv]
-                conflict_mask = (won_targets != t_surv)
-                
-                if torch.any(conflict_mask):
-                    c_left = won_targets[conflict_mask]
-                    c_right = t_surv[conflict_mask]
-                    c_batch = b_surv[conflict_mask]
-                    next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                    next_batch_pieces.append(c_batch)
-                
-            # --- Handle Function/Constant Symbols ---
-            fun_mask = ~l_is_v & ~r_is_v
-            f_left, f_right = left[fun_mask], right[fun_mask]
-            f_batch = batch_idx[fun_mask]
-            
-            if f_left.shape[0] > 0:
                 mismatch = (self.nodes[f_left] != self.nodes[f_right])
                 if torch.any(mismatch):
                     success_mask[f_batch[mismatch]] = False
@@ -199,8 +206,9 @@ class BatchedGPUUnifier:
                     
                     valid_pad = (c_left != -1) & (c_right != -1)
                     
-                    next_frontier_pieces.append(torch.stack([c_left[valid_pad], c_right[valid_pad]], dim=1))
-                    next_batch_pieces.append(c_batch[valid_pad])
+                    if torch.any(valid_pad):
+                        next_frontier_pieces.append(torch.stack([c_left[valid_pad], c_right[valid_pad]], dim=1))
+                        next_batch_pieces.append(c_batch[valid_pad])
             
             if len(next_frontier_pieces) > 0:
                 frontier = torch.cat(next_frontier_pieces, dim=0)
