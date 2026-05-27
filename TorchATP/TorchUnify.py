@@ -209,10 +209,7 @@ class SingleUnifierWrapper:
     def __init__(self, subs_row):
         self.subs = subs_row
         
-    def update_ref(self, indices, b_idx=None): # Safe default
-        curr = indices.clone()
-        
-    def update_ref(self, indices):
+    def update_ref(self, indices, b_idx=None): # Safe default handles both signatures
         curr = indices.clone()
         valid_mask = (curr != -1)
         active = valid_mask.clone()
@@ -378,32 +375,35 @@ class NeuralProverPipeline:
 
     def batched_instantiate_in_arena(self, batched_requests, unifier):
         """
-        batched_requests: A 2D tensor of shape [N, 2]. 
-                          Column 0 is the batch_idx (reality ID).
+        batched_requests: A 2D tensor of shape [R, 2] where R is the number of SUCCESSFUL requests. 
+                          Column 0 is the original batch_idx (reality ID).
                           Column 1 is the root_idx to copy.
         """
         if batched_requests.shape[0] == 0:
             return []
 
-        current_arena_size = self.parser.nodes.shape[0]
-        num_batches = unifier.subs.shape[0]
+        current_arena_size = self.parser.arena_ptr
+        R = batched_requests.shape[0] # Only the amount of SUCCESSFUL batches!
         
-        # 1. THE 2D MEMOIZATION TABLE (Flattened for VRAM safety)
-        # Size: [num_batches * current_arena_size]
+        # 1. THE 2D MEMOIZATION TABLE (Safely bounded by R, preventing VRAM explosions)
+        # Size: [R * current_arena_size] 
         old_to_new = torch.full(
-            (num_batches * current_arena_size,), -1, 
+            (R * current_arena_size,), -1, 
             dtype=torch.long, device=self.device
         )
         
-        # Initial Frontier tracking: [batch_idx, node_idx]
-        b_idx = batched_requests[:, 0]
+        # Extract the absolute/original batch IDs (e.g., 5, 102, 24999)
+        original_b_idx = batched_requests[:, 0]
         roots_old = batched_requests[:, 1]
         
-        # Dereference the roots according to their specific realities
-        true_roots = unifier.update_ref(roots_old, b_idx)
+        # Create dense local IDs to compress the coordinate math (e.g., 0, 1, 2)
+        local_b_idx = torch.arange(R, dtype=torch.long, device=self.device)
         
-        # Generate the unique flattened keys for the roots
-        root_keys = (b_idx * current_arena_size) + true_roots
+        # Dereference the roots using their absolute reality IDs
+        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        
+        # Generate the unique flattened keys using the COMPRESSED local IDs
+        root_keys = (local_b_idx * current_arena_size) + true_roots
         
         # Allocate fresh indices for unique roots
         unique_root_keys = torch.unique(root_keys)
@@ -419,8 +419,8 @@ class NeuralProverPipeline:
         
         # 2. THE BATCHED BFS LOOP
         while frontier_keys.numel() > 0:
-            # Decode the flat keys back into 2D coordinates
-            current_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
+            # Decode the flat keys back into local 2D coordinates
+            current_local_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
             current_nodes = frontier_keys % current_arena_size
             
             # Fetch structural data for the current batch of nodes
@@ -432,18 +432,18 @@ class NeuralProverPipeline:
             
             # 3. EXPAND CHILDREN
             if valid_mask.any():
-                # We must expand the batch indices to match the children shape
-                # If a node has 2 children, its batch_idx must be duplicated twice
-                expanded_b_idx = current_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
+                expanded_local_b_idx = current_local_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
                 
-                valid_b_idx = expanded_b_idx[valid_mask]
+                valid_local_b_idx = expanded_local_b_idx[valid_mask]
                 valid_children_old = level_children[valid_mask]
                 
-                # Dereference the children in their specific realities
-                true_children = unifier.update_ref(valid_children_old, valid_b_idx)
+                # --- TRANSLATION STEP ---
+                # Map the compressed local ID back to the absolute ID to query the unifier
+                valid_original_b_idx = original_b_idx[valid_local_b_idx]
+                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
                 
-                # Generate keys for the children
-                child_keys = (valid_b_idx * current_arena_size) + true_children
+                # Generate keys for the children using the local ID
+                child_keys = (valid_local_b_idx * current_arena_size) + true_children
                 
                 # 4. FILTER UNALLOCATED NODES
                 unallocated_mask = old_to_new[child_keys] == -1

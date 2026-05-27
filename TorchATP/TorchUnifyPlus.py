@@ -83,6 +83,7 @@ class BatchedGPUUnifier:
         """
         Iterative, batched unification loop.
         Allocates a clean 2D [num_pairs, num_nodes] substitution matrix per run.
+        Applies Sequential Deferral via high-speed scatter to prevent intra-batch cycles.
         """
         num_pairs = pair_batch.shape[0]
 
@@ -118,70 +119,63 @@ class BatchedGPUUnifier:
             next_frontier_pieces = []
             next_batch_pieces = []
             
-            # --- Bind Variables on LEFT ---
-            if torch.any(l_is_v):
-                v_idx, t_idx = left[l_is_v], right[l_is_v]
-                b_idx = batch_idx[l_is_v]
+            # --- CONSOLIDATED VARIABLE BINDING ---
+            is_var_pair = l_is_v | r_is_v
+            
+            if torch.any(is_var_pair):
+                v_left = left[is_var_pair]
+                v_right = right[is_var_pair]
+                v_l_is_v = l_is_v[is_var_pair]
                 
-                failed_occurs = self.occurs_check(v_idx, t_idx, b_idx)
-
+                # Consolidate so `v_idx` is ALWAYS the variable, `t_idx` is the target
+                v_idx = torch.where(v_l_is_v, v_left, v_right)
+                t_idx = torch.where(v_l_is_v, v_right, v_left)
+                b_idx_all = batch_idx[is_var_pair]
+                
+                # --- FAST INTRA-BATCH DEFERRAL (THE FIX) ---
+                # We extract the unique realities currently processing variables
+                unique_b, inverse_indices = torch.unique(b_idx_all, return_inverse=True)
+                idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
+                
+                # Use scatter to isolate exactly ONE equation per reality in O(N) time
+                first_occ_idx = torch.zeros(len(unique_b), dtype=torch.long, device=self.nodes.device)
+                first_occ_idx.scatter_(0, inverse_indices.flip(0), idx_seq.flip(0))
+                
+                process_v = v_idx[first_occ_idx]
+                process_t = t_idx[first_occ_idx]
+                process_b = b_idx_all[first_occ_idx]
+                
+                # Defer the remaining duplicates safely to the next wave
+                deferred_mask = torch.ones(len(b_idx_all), dtype=torch.bool, device=self.nodes.device)
+                deferred_mask[first_occ_idx] = False
+                
+                if torch.any(deferred_mask):
+                    next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
+                    next_batch_pieces.append(b_idx_all[deferred_mask])
+                    
+                # 1. OCCURS CHECK
+                failed_occurs = self.occurs_check(process_v, process_t, process_b)
+                
                 if torch.any(failed_occurs):
-                    success_mask[b_idx[failed_occurs]] = False
-                
-                survivors = ~failed_occurs
-                v_surv, t_surv = v_idx[survivors], t_idx[survivors]
-                b_surv = b_idx[survivors]
-                
-                # 2D ASSIGNMENT
-                self.subs[b_surv, v_surv] = t_surv
-                
-                # 2D CONFLICT CHECK
-                won_targets = self.subs[b_surv, v_surv]
-                conflict_mask = (won_targets != t_surv)
-                
-                if torch.any(conflict_mask):
-                    c_left = won_targets[conflict_mask]
-                    c_right = t_surv[conflict_mask]
-                    c_batch = b_surv[conflict_mask]
-                    next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                    next_batch_pieces.append(c_batch)
-                
-            # --- Bind Variables on RIGHT ---
-            r_bind_mask = r_is_v & ~l_is_v
-        
-            if torch.any(r_bind_mask):
-                v_idx, t_idx = right[r_bind_mask], left[r_bind_mask]
-                b_idx = batch_idx[r_bind_mask]
-                
-                failed_occurs = self.occurs_check(v_idx, t_idx, b_idx)
-                
-                if torch.any(failed_occurs):
-                    success_mask[b_idx[failed_occurs]] = False
+                    success_mask[process_b[failed_occurs]] = False
                     
                 survivors = ~failed_occurs
-                v_surv, t_surv = v_idx[survivors], t_idx[survivors]
-                b_surv = b_idx[survivors]
+                s_v = process_v[survivors]
+                s_t = process_t[survivors]
+                s_b = process_b[survivors]
                 
-                # 2D ASSIGNMENT
-                self.subs[b_surv, v_surv] = t_surv
+                # 2. WRITE SUBSTITUTIONS (Conflict Check Removed!)
+                # Because of update_ref and sequential deferral, s_v is guaranteed 
+                # to be unbound and unique to this wave. We just write it directly!
+                if s_v.shape[0] > 0:
+                    self.subs[s_b, s_v] = s_t
                 
-                # 2D CONFLICT CHECK
-                won_targets = self.subs[b_surv, v_surv]
-                conflict_mask = (won_targets != t_surv)
+            # --- HANDLE FUNCTION/CONSTANT SYMBOLS ---
+            fun_mask = ~is_var_pair
+            if torch.any(fun_mask):
+                f_left, f_right = left[fun_mask], right[fun_mask]
+                f_batch = batch_idx[fun_mask]
                 
-                if torch.any(conflict_mask):
-                    c_left = won_targets[conflict_mask]
-                    c_right = t_surv[conflict_mask]
-                    c_batch = b_surv[conflict_mask]
-                    next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                    next_batch_pieces.append(c_batch)
-                
-            # --- Handle Function/Constant Symbols ---
-            fun_mask = ~l_is_v & ~r_is_v
-            f_left, f_right = left[fun_mask], right[fun_mask]
-            f_batch = batch_idx[fun_mask]
-            
-            if f_left.shape[0] > 0:
                 mismatch = (self.nodes[f_left] != self.nodes[f_right])
                 if torch.any(mismatch):
                     success_mask[f_batch[mismatch]] = False
@@ -199,8 +193,9 @@ class BatchedGPUUnifier:
                     
                     valid_pad = (c_left != -1) & (c_right != -1)
                     
-                    next_frontier_pieces.append(torch.stack([c_left[valid_pad], c_right[valid_pad]], dim=1))
-                    next_batch_pieces.append(c_batch[valid_pad])
+                    if torch.any(valid_pad):
+                        next_frontier_pieces.append(torch.stack([c_left[valid_pad], c_right[valid_pad]], dim=1))
+                        next_batch_pieces.append(c_batch[valid_pad])
             
             if len(next_frontier_pieces) > 0:
                 frontier = torch.cat(next_frontier_pieces, dim=0)
@@ -214,10 +209,7 @@ class SingleUnifierWrapper:
     def __init__(self, subs_row):
         self.subs = subs_row
         
-    def update_ref(self, indices, b_idx=None): # Safe default
-        curr = indices.clone()
-        
-    def update_ref(self, indices):
+    def update_ref(self, indices, b_idx=None): # Safe default handles both signatures
         curr = indices.clone()
         valid_mask = (curr != -1)
         active = valid_mask.clone()
@@ -388,32 +380,35 @@ class NeuralProverPipeline:
 
     def batched_instantiate_in_arena(self, batched_requests, unifier):
         """
-        batched_requests: A 2D tensor of shape [N, 2]. 
-                          Column 0 is the batch_idx (reality ID).
+        batched_requests: A 2D tensor of shape [R, 2] where R is the number of SUCCESSFUL requests. 
+                          Column 0 is the original batch_idx (reality ID).
                           Column 1 is the root_idx to copy.
         """
         if batched_requests.shape[0] == 0:
             return []
 
         current_arena_size = self.parser.arena_ptr
-        num_batches = unifier.subs.shape[0]
+        R = batched_requests.shape[0] # Only the amount of SUCCESSFUL batches!
         
-        # 1. THE 2D MEMOIZATION TABLE (Flattened for VRAM safety)
-        # Size: [num_batches * current_arena_size]
+        # 1. THE 2D MEMOIZATION TABLE (Safely bounded by R, preventing VRAM explosions)
+        # Size: [R * current_arena_size] 
         old_to_new = torch.full(
-            (num_batches * current_arena_size,), -1, 
+            (R * current_arena_size,), -1, 
             dtype=torch.long, device=self.device
         )
         
-        # Initial Frontier tracking: [batch_idx, node_idx]
-        b_idx = batched_requests[:, 0]
+        # Extract the absolute/original batch IDs (e.g., 5, 102, 24999)
+        original_b_idx = batched_requests[:, 0]
         roots_old = batched_requests[:, 1]
         
-        # Dereference the roots according to their specific realities
-        true_roots = unifier.update_ref(roots_old, b_idx)
+        # Create dense local IDs to compress the coordinate math (e.g., 0, 1, 2)
+        local_b_idx = torch.arange(R, dtype=torch.long, device=self.device)
         
-        # Generate the unique flattened keys for the roots
-        root_keys = (b_idx * current_arena_size) + true_roots
+        # Dereference the roots using their absolute reality IDs
+        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        
+        # Generate the unique flattened keys using the COMPRESSED local IDs
+        root_keys = (local_b_idx * current_arena_size) + true_roots
         
         # Allocate fresh indices for unique roots
         unique_root_keys = torch.unique(root_keys)
@@ -429,8 +424,8 @@ class NeuralProverPipeline:
         
         # 2. THE BATCHED BFS LOOP
         while frontier_keys.numel() > 0:
-            # Decode the flat keys back into 2D coordinates
-            current_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
+            # Decode the flat keys back into local 2D coordinates
+            current_local_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
             current_nodes = frontier_keys % current_arena_size
             
             # Fetch structural data for the current batch of nodes
@@ -442,18 +437,18 @@ class NeuralProverPipeline:
             
             # 3. EXPAND CHILDREN
             if valid_mask.any():
-                # We must expand the batch indices to match the children shape
-                # If a node has 2 children, its batch_idx must be duplicated twice
-                expanded_b_idx = current_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
+                expanded_local_b_idx = current_local_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
                 
-                valid_b_idx = expanded_b_idx[valid_mask]
+                valid_local_b_idx = expanded_local_b_idx[valid_mask]
                 valid_children_old = level_children[valid_mask]
                 
-                # Dereference the children in their specific realities
-                true_children = unifier.update_ref(valid_children_old, valid_b_idx)
+                # --- TRANSLATION STEP ---
+                # Map the compressed local ID back to the absolute ID to query the unifier
+                valid_original_b_idx = original_b_idx[valid_local_b_idx]
+                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
                 
-                # Generate keys for the children
-                child_keys = (valid_b_idx * current_arena_size) + true_children
+                # Generate keys for the children using the local ID
+                child_keys = (valid_local_b_idx * current_arena_size) + true_children
                 
                 # 4. FILTER UNALLOCATED NODES
                 unallocated_mask = old_to_new[child_keys] == -1
