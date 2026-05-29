@@ -2,7 +2,6 @@ import torch
 #import TorchUnify
 import TorchUnifyPlus
 import TorchParse
-import TorchSat
 import TorchSimpBatchPlus
 from TorchClauses import parse_tptp_to_virtual_clause
 import TorchClausesPlus
@@ -29,7 +28,7 @@ tptp_res_test = [
     "cnf(taut,axiom,(p(X4)|~p(X4)))."
 ]
 
-pipeline = TorchUnifyPlus.NeuralProverPipeline(device='cpu')
+pipeline = TorchUnifyPlus.ProverPipeline(device='cpu')
 
 given_clause = TorchClausesPlus.parse_tptp_to_virtual_clause(tptp_res_test[1], pipeline)
 processed_clause = [TorchClausesPlus.parse_tptp_to_virtual_clause( tptp_res_test[2], pipeline)]

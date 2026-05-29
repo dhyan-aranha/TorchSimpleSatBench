@@ -5,6 +5,12 @@ import TorchUnify
 from derivations import Derivation, flatDerivation
 from TorchClauses import Clause, VirtualClause, decode_virtual_clause, Literal, parse_tptp_to_virtual_clause
 
+# This implements a batched version of Schulz's simplesat.py algorithm. Here
+# we keep everything on the GPU as long as possible and only print to strings
+# at the end if a proof is found. This requires using batched_instantiate_in_arena
+# which after a batch of MGU's has been found goes into various clauses and tries to 
+# carry out the subsitituion on the level of pytorch tensors. 
+
 logging.basicConfig(
     level=logging.DEBUG, # Change this to logging.INFO when benchmarking!
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -16,9 +22,10 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
     candidate_pairs = []
     parent_metadata = []
 
-    # --- 1. Find inter-clause matches ---
+    
     for p_clause in processed_pool:
-        # --- THE SELF-RESOLUTION FIX ---
+
+        # Deals with self resolutions
         if p_clause is given_clause:
             g_str = decode_virtual_clause(given_clause, pipeline)
             dummy_tptp = f"cnf({given_clause.name}_clone, plain, ({g_str}))."
@@ -42,7 +49,7 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
     logger.debug(f"Candidate Pairs: {candidate_pairs}")
     logger.debug(f"Sending {len(candidate_pairs)} candidate pairs to GPU Unifier...")
 
-    # --- 2. Batched GPU Unification ---
+    # Send batch of candidate pairs to be unified. 
     subs, success_mask, unifier = pipeline.prove_batch_indices(
         candidate_pairs, standardize_apart=True 
     )
@@ -57,7 +64,7 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
 
     logger.debug(f"GPU Unification complete. {len(successful_indices)} pairs successfully unified.")
 
-    # --- 3. THE PACKING PHASE ---
+    
     all_requests = []
     clause_blueprints = []
 
@@ -94,49 +101,49 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
     arena_size_before = pipeline.parser.nodes.shape[0]
     logger.debug(f"Arena Size BEFORE Instantiation: {arena_size_before} nodes")
     
-    # --- 4. THE EXECUTION PHASE ---
+    
     if all_requests:
         batched_requests_tensor = torch.tensor(all_requests, dtype=torch.long, device=pipeline.device)
-        # 1 MASSIVE GPU CALL replaces the loop!
         new_roots_flat = pipeline.batched_instantiate_in_arena(batched_requests_tensor, unifier).tolist()
         logger.debug(f"new roots flat : {new_roots_flat}")
     else:
         # Handles the edge case where resolving two unit clauses leaves 0 roots to copy
         new_roots_flat = []
 
-    # debugging 
+    # Debugging block
     arena_size_after = pipeline.parser.nodes.shape[0]
-    nodes_minted = arena_size_after - arena_size_before
+    nodes_made = arena_size_after - arena_size_before
     logger.debug(f"Arena Size AFTER Instantiation: {arena_size_after} nodes")
-    logger.debug(f"HIDDEN WORK: The GPU secretly minted {nodes_minted} new nodes to support roots {new_roots_flat}")
-    if nodes_minted > 0:
+    logger.debug(f"HIDDEN WORK: The GPU secretly made {nodes_made} new nodes to support roots {new_roots_flat}")
+    if nodes_made > 0:
         logger.debug(f"full nodes tensor: {pipeline.parser.nodes}")
         minted_nodes = pipeline.parser.nodes[arena_size_before:]
         minted_children = pipeline.parser.children[arena_size_before:]
-        logger.debug(f"minuted nodes: {minted_nodes}")
-        logger.debug(f"minted childre: {minted_children}")
+        logger.debug(f"made nodes: {minted_nodes}")
+        logger.debug(f"made children: {minted_children}")
 
         # map back to human readable symbols
         vocab_id_to_sym = { v: k for k, v in pipeline.parser.global_vocab.items()}
         vocab_id_to_sym[-2] = "VAR"
 
         human_symbols = [vocab_id_to_sym.get(n.item(), "?") for n in minted_nodes]
-        logger.debug(f"Minted symbols : {human_symbols}")
-        logger.debug(f"Minted pointers: \n{minted_children.tolist()}")
+        logger.debug(f"made symbols : {human_symbols}")
+        logger.debug(f"made pointers: \n{minted_children.tolist()}")
+    # End of debugging block
 
-    # --- 5. THE RE-STITCHING PHASE ---
+    # Put clauses back together. 
     ptr = 0
     for blueprint in clause_blueprints:
         new_literals = []
         
-        # Pop exactly the right amount of roots for Clause 1
+        # Pop roots for Clause 1
         num_c1 = len(blueprint["c1_signs"])
         for i in range(num_c1):
             new_literals.append((blueprint["c1_signs"][i], new_roots_flat[ptr]))
             ptr += 1
         logger.debug(f"new literals from clause 1: {new_literals}")
             
-        # Pop exactly the right amount of roots for Clause 2
+        # Pop roots for Clause 2
         num_c2 = len(blueprint["c2_signs"])
         for i in range(num_c2):
             new_literals.append((blueprint["c2_signs"][i], new_roots_flat[ptr]))
@@ -160,7 +167,7 @@ def compute_given_clause_factors_tensor(given_clause, pipeline):
     queries = []
     metadata = []
     
-    # --- 1. Find Intra-Clause Matches ---
+    # Find Intra-Clause Matches
     lits = given_clause.literals
     for i in range(len(lits)):
         for j in range(i + 1, len(lits)):
@@ -174,7 +181,7 @@ def compute_given_clause_factors_tensor(given_clause, pipeline):
     if not queries:
         return factors
         
-    # --- 2. Batched GPU Unification ---
+    
     subs, success_mask, unifier = pipeline.prove_batch_indices(queries)
     
     successful_indices = torch.nonzero(success_mask).squeeze(-1)
@@ -183,7 +190,7 @@ def compute_given_clause_factors_tensor(given_clause, pipeline):
     else:
         successful_indices = successful_indices.tolist()
 
-    # --- 3. THE PACKING PHASE ---
+    
     all_requests = []
     factor_blueprints = []
 
@@ -199,14 +206,14 @@ def compute_given_clause_factors_tensor(given_clause, pipeline):
                 
         factor_blueprints.append({"signs": signs})
 
-    # --- 4. THE EXECUTION PHASE ---
+    
     if all_requests:
         batched_requests_tensor = torch.tensor(all_requests, dtype=torch.long, device=pipeline.device)
         new_roots_flat = pipeline.batched_instantiate_in_arena(batched_requests_tensor, unifier).tolist()
     else:
         new_roots_flat = []
 
-    # --- 5. THE RE-STITCHING PHASE ---
+    
     ptr = 0
     for blueprint in factor_blueprints:
         new_literals = []
@@ -226,11 +233,11 @@ def compute_given_clause_factors_tensor(given_clause, pipeline):
 
 def run_given_clause_benchmark_tensor(tptp_strings, pipeline, max_loops=2000):
     
-    # 1. Parse all strings into the Python-list memory arena
+    # Parse all strings into the Python-list memory arena
     unprocessed = [parse_tptp_to_virtual_clause(s, pipeline) for s in tptp_strings]
     processed = []
     
-    # 2. THE TENSOR TRANSITION (Seal the arena and move to GPU)
+    # Convert arrays to pytorch tensors. 
     if isinstance(pipeline.parser.nodes, list):
         pipeline.parser.nodes = torch.tensor(
             pipeline.parser.nodes, dtype=torch.long, device=pipeline.device
@@ -252,17 +259,17 @@ def run_given_clause_benchmark_tensor(tptp_strings, pipeline, max_loops=2000):
         # Selection: Pure FIFO
         given_clause = unprocessed.pop(0)
         
-        # Only pay the cost of string translation if we are actively debugging
+        # Debugging
         if logger.isEnabledFor(logging.DEBUG):
             readable_given = decode_virtual_clause(given_clause, pipeline)
             logger.debug(f"\n--- Loop {loops} ---")
             logger.debug(f"Selected Given Clause: {readable_given}")
             logger.debug(f"Unprocessed Queue Size: {len(unprocessed)}")
         
-        # Activation
+        
         processed.append(given_clause)
         
-        # GPU Inferences (assuming you also update factors to pure tensors)
+        
         new_factors = compute_given_clause_factors_tensor(given_clause, pipeline)
         new_resolvents = compute_given_clause_resolvents_tensor(given_clause, processed, pipeline)
         
@@ -285,7 +292,7 @@ def run_given_clause_benchmark_tensor(tptp_strings, pipeline, max_loops=2000):
                     
                 return {"status": "Theorem", "loops": loops, "clauses": total_clauses_generated}
                 
-        # Retention
+        
         unprocessed.extend(new_clauses)
 
     logger.warning("Search space exhausted or max loops reached.")

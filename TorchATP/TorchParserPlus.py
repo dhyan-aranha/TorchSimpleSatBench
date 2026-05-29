@@ -1,12 +1,16 @@
 import torch
 from lexer import Lexer, Token 
 
+# Essential the same as TorchParse but we include arena_ptr to the init method 
+# to be used by our batched subsitution method : batched_instantiate_in_arena. Here
+# the word "arena" is used in the sense computer science to denote one contiguous chunk of memory.
+
+
 class LogicParser:
     def __init__(self):
         self.global_vocab = {}
         self.next_vocab_id = 1
         
-        # Starts at 0, dynamically expands as it reads the TPTP file
         self.max_arity = 0
 
         self.var_maps = []
@@ -21,11 +25,10 @@ class LogicParser:
         roots = []
         
         for clause in clause_strings:
-            # Initialize the Lexer for this specific clause
+            
             lexer = Lexer(clause)
             local_vars = {}
             
-            # Pass the lexer state directly into the recursive parser
             root_idx = self._parse_term(lexer, local_vars)
             roots.append(root_idx)
             
@@ -104,12 +107,8 @@ class LogicParser:
             idx = len(self.nodes)
             self.nodes.append(self.global_vocab[symbol])
             self.is_var_mask.append(False)
-            
-            # --- 1. RESERVE THE ROW IMMEDIATELY ---
-            # This locks the child array index to perfectly match 'idx'
             self.children.append([-1] * self.max_arity) 
-            # --------------------------------------
-            
+
             arg_indices = []
             
             # Check if this symbol has arguments (a following '(')
@@ -127,7 +126,6 @@ class LogicParser:
                     
                 lexer.AcceptTok(Token.ClosePar) # consume ')'
                 
-            # DYNAMIC ARITY EXPANSION
             num_args = len(arg_indices)
             
             if num_args > self.max_arity:
@@ -139,9 +137,8 @@ class LogicParser:
             while len(arg_indices) < self.max_arity:
                 arg_indices.append(-1)
                 
-            # --- 2. UPDATE THE RESERVED ROW ---
-            # Do NOT use .append() here! Overwrite the placeholder we reserved.
+            
             self.children[idx] = arg_indices
-            # ----------------------------------
+            
                 
             return idx

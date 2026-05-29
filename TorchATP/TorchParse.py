@@ -6,7 +6,7 @@ class LogicParser:
         self.global_vocab = {}
         self.next_vocab_id = 1
         
-        # Starts at 0, dynamically expands as it reads the TPTP file
+        
         self.max_arity = 0
 
         self.var_maps = []
@@ -20,11 +20,10 @@ class LogicParser:
         roots = []
         
         for clause in clause_strings:
-            # Initialize the Lexer for this specific clause
+            
             lexer = Lexer(clause)
             local_vars = {}
-            
-            # Pass the lexer state directly into the recursive parser
+        
             root_idx = self._parse_term(lexer, local_vars)
             roots.append(root_idx)
             
@@ -61,7 +60,7 @@ class LogicParser:
             torch.tensor(self.nodes),
             torch.tensor(self.children),
             torch.tensor(self.is_var_mask, dtype=torch.bool),
-            torch.tensor(roots) # Shape will be [Batch_Size, 2]
+            torch.tensor(roots) 
         )
     
     def _parse_term(self, lexer, local_vars):
@@ -104,10 +103,10 @@ class LogicParser:
             self.nodes.append(self.global_vocab[symbol])
             self.is_var_mask.append(False)
             
-            # --- 1. RESERVE THE ROW IMMEDIATELY ---
-            # This locks the child array index to perfectly match 'idx'
+            
+            # This locks the child array index to match 'idx'
             self.children.append([-1] * self.max_arity) 
-            # --------------------------------------
+            
             
             arg_indices = []
             
@@ -126,7 +125,7 @@ class LogicParser:
                     
                 lexer.AcceptTok(Token.ClosePar) # consume ')'
                 
-            # DYNAMIC ARITY EXPANSION
+            # Dynamic arity expansion
             num_args = len(arg_indices)
             
             if num_args > self.max_arity:
@@ -138,9 +137,8 @@ class LogicParser:
             while len(arg_indices) < self.max_arity:
                 arg_indices.append(-1)
                 
-            # --- 2. UPDATE THE RESERVED ROW ---
-            # Do NOT use .append() here! Overwrite the placeholder we reserved.
+            
             self.children[idx] = arg_indices
-            # ----------------------------------
+            
                 
             return idx

@@ -64,7 +64,6 @@ class VirtualClause(Derivable):
         return len(self.literals) == 0
         
     def deduplicate(self):
-        # set() easily deduplicates the exact identical tuples
         self.literals = list(set(self.literals))
 
 def decode_virtual_clause(v_clause, pipeline):
@@ -78,9 +77,6 @@ def decode_virtual_clause(v_clause, pipeline):
     id_to_symbol = {v: k for k, v in pipeline.parser.global_vocab.items()}
     dummy_var_map = {} 
     
-    # --- THE FIX ---
-    # Create a blank unifier wrapped around the global memory arena
-    # so decode_term has access to update_ref and the tensor arrays.
     dummy_unifier = TorchUnify.BatchedGPUUnifier(
         pipeline.parser.nodes, 
         pipeline.parser.children, 
@@ -91,7 +87,7 @@ def decode_virtual_clause(v_clause, pipeline):
     lit_strings = []
     
     for is_neg, root_idx in v_clause.literals:
-        # Pass the dummy_unifier instead of the pipeline!
+        
         lit_str = pipeline.decode_term(root_idx, dummy_unifier, id_to_symbol, dummy_var_map)
         
         if is_neg:
@@ -112,10 +108,10 @@ def parse_tptp_string(tptp_str):
     name = match.group(1).strip()
     literal_block = match.group(2).strip()
 
-    # 2. Split by the OR operator
+    
     raw_literals = literal_block.split('|')
 
-    # 3. Build Literal objects
+    
     parsed_literals = []
     for raw_lit in raw_literals:
         raw_lit = raw_lit.strip()
@@ -132,7 +128,7 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     this is a side effect!) Returns a VirtualClause containing tuples of (is_negative_bool, root_index_int).
     Safely toggles between List and Tensor states to prevent GPU pipeline crashes.
     """
-    # 1. Extract the name and the literal block
+    # Extract the name and the literal block
     match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*\((.*)\)\s*\)\.?", tptp_str.strip())
     if not match:
         raise ValueError(f"Could not parse TPTP string: {tptp_str}")
@@ -140,14 +136,14 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     name = match.group(1).strip()
     literal_block = match.group(2).strip()
     
-    # 2. Split by the OR operator
+    #  Split by the OR operator
     raw_literals = literal_block.split('|')
     
-    # CRITICAL: A single clause must share ONE variable map for factoring to work!
+    # A single clause must share one variable map for factoring to work
     local_vars = {}
     virtual_literals = []
     
-    #  State-Saver for PyTorch Tensors
+    # State-Saver for PyTorch Tensors
     was_tensor = False
     device = 'cpu'
     if isinstance(pipeline.parser.nodes, torch.Tensor):
@@ -160,19 +156,19 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     for raw_lit in raw_literals:
         raw_lit = raw_lit.strip()
         
-        # 3. Extract and strip the polarity
+        # Extract and strip the polarity
         is_neg = raw_lit.startswith('~')
         atom_str = raw_lit[1:] if is_neg else raw_lit
         atom_str = atom_str.strip()
         
-        # 4. Parse the pure positive atom into the memory arena
+        # Parse the pure positive atom into the memory arena
         lexer = Lexer(atom_str)
         root_idx = pipeline.parser._parse_term(lexer, local_vars)
         
-        # 5. Save as a tuple
+        # Save as a tuple
         virtual_literals.append((is_neg, root_idx))
         
-    # --- RESTORE THE ARENA: If it was a GPU tensor, push the new nodes to VRAM ---
+    # Restore the arena : If it was a GPU tensor, push the new nodes to VRAM ---
     if was_tensor:
         pipeline.parser.nodes = torch.tensor(pipeline.parser.nodes, dtype=torch.long, device=device)
         pipeline.parser.children = torch.tensor(pipeline.parser.children, dtype=torch.long, device=device)

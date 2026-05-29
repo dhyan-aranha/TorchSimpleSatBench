@@ -64,7 +64,6 @@ class VirtualClause(Derivable):
         return len(self.literals) == 0
         
     def deduplicate(self):
-        # set() easily deduplicates the exact identical tuples
         self.literals = list(set(self.literals))
 
 def decode_virtual_clause(v_clause, pipeline):
@@ -78,9 +77,7 @@ def decode_virtual_clause(v_clause, pipeline):
     id_to_symbol = {v: k for k, v in pipeline.parser.global_vocab.items()}
     dummy_var_map = {} 
     
-    # --- THE FIX ---
-    # Create a blank unifier wrapped around the global memory arena
-    # so decode_term has access to update_ref and the tensor arrays.
+    
     dummy_unifier = TorchUnifyPlus.BatchedGPUUnifier(
         pipeline.parser.nodes, 
         pipeline.parser.children, 
@@ -91,7 +88,7 @@ def decode_virtual_clause(v_clause, pipeline):
     lit_strings = []
     
     for is_neg, root_idx in v_clause.literals:
-        # Pass the dummy_unifier instead of the pipeline!
+        
         lit_str = pipeline.decode_term(root_idx, dummy_unifier, id_to_symbol, dummy_var_map)
         
         if is_neg:
@@ -112,10 +109,10 @@ def parse_tptp_string(tptp_str):
     name = match.group(1).strip()
     literal_block = match.group(2).strip()
 
-    # 2. Split by the OR operator
+    
     raw_literals = literal_block.split('|')
 
-    # 3. Build Literal objects
+    
     parsed_literals = []
     for raw_lit in raw_literals:
         raw_lit = raw_lit.strip()
@@ -132,10 +129,10 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     Returns a VirtualClause containing tuples of (is_negative_bool, root_index_int).
     Safely toggles between List and Tensor states to prevent GPU pipeline crashes.
     """
-    # 1. Extract the name and the literal block
+    
     match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*\((.*)\)\s*\)\.?", tptp_str.strip())
     if not match:
-        # Fallback if it lacks the outer parens: cnf(name, role, INNER).
+        
         match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*(.*)\)\.?", tptp_str.strip())
         
     if not match:
@@ -144,14 +141,14 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     name = match.group(1).strip()
     literal_block = match.group(2).strip()
     
-    # 2. Split by the OR operator
+    
     raw_literals = literal_block.split('|')
     
-    # CRITICAL: A single clause must share ONE variable map for factoring to work!
+    
     local_vars = {}
     virtual_literals = []
     
-    # --- PRE-PARSE EXTRACTION BLOCK: State-Saver for PyTorch Tensors ---
+    
     was_tensor = False
     device = 'cpu'
     if isinstance(pipeline.parser.nodes, torch.Tensor):
@@ -159,18 +156,18 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
         device = pipeline.parser.nodes.device
         ptr = pipeline.parser.arena_ptr
         
-        # 1. Save references to the massive 5M tensors so we don't delete them!
+        # Save references to tensors so we don't delete them
         saved_nodes_tensor = pipeline.parser.nodes
         saved_children_tensor = pipeline.parser.children
         saved_mask_tensor = pipeline.parser.is_var_mask
         
-        # 2. Extract ONLY the active data slice and convert to fast Python lists
+        # Extract only the active data slice and convert to fast Python lists
         pipeline.parser.nodes = saved_nodes_tensor[:ptr].tolist()
         pipeline.parser.children = saved_children_tensor[:ptr].tolist()
         pipeline.parser.is_var_mask = saved_mask_tensor[:ptr].tolist()
-    # -------------------------------------------------------------------
+    
 
-    # 3. Parse each literal into the continuous global arena
+    # Parse each literal into the continuous global arena
     for raw_lit in raw_literals:
         raw_lit = raw_lit.strip()
         
@@ -186,7 +183,7 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
         # Save as a tuple
         virtual_literals.append((is_neg, root_idx))
         
-    # --- POST-PARSE RESTORATION BLOCK: Push delta back to 5M VRAM buffer ---
+    
     if was_tensor:
         new_len = len(pipeline.parser.nodes)
         num_new = new_len - ptr
@@ -195,12 +192,12 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
             if ptr + num_new > saved_nodes_tensor.shape[0]:
                 raise MemoryError("VRAM Arena Capacity Exceeded during parsing!")
                 
-            # 1. Extract ONLY the newly appended items from the lists
+            # 1. Extract only the newly appended items from the lists
             new_nodes = torch.tensor(pipeline.parser.nodes[ptr:], dtype=torch.long, device=device)
             new_children = torch.tensor(pipeline.parser.children[ptr:], dtype=torch.long, device=device)
             new_mask = torch.tensor(pipeline.parser.is_var_mask[ptr:], dtype=torch.bool, device=device)
             
-            # 2. Write them directly into the empty space of the 5M VRAM buffer
+            # 2. Write them directly into the empty space of VRAM buffer
             saved_nodes_tensor[ptr : ptr + num_new] = new_nodes
             saved_children_tensor[ptr : ptr + num_new] = new_children
             saved_mask_tensor[ptr : ptr + num_new] = new_mask
@@ -212,7 +209,7 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
         pipeline.parser.nodes = saved_nodes_tensor
         pipeline.parser.children = saved_children_tensor
         pipeline.parser.is_var_mask = saved_mask_tensor
-    # -----------------------------------------------------------------------
+    
         
     # Save the clause's variable map into the pipeline's history for debugging
     pipeline.parser.var_maps.append(local_vars)
