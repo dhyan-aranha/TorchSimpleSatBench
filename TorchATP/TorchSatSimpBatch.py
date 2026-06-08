@@ -33,8 +33,10 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
         else:
             target_p_clause = p_clause
         
+        logger.debug(f"pipeline : {pipeline.parser.nodes}")
         logger.debug(f"given clause literals : {given_clause.literals}")
         logger.debug(f"target clause literals : {target_p_clause.literals}")
+
         for idx_g, (is_neg_g, root_g) in enumerate(given_clause.literals):
             for idx_p, (is_neg_p, root_p) in enumerate(target_p_clause.literals):
                 if is_neg_g != is_neg_p:
@@ -54,6 +56,7 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
         candidate_pairs, standardize_apart=True 
     )
 
+    logger.debug(f"Subs tensor : {subs}")
     logger.debug(f"These are the nodes: {unifier.nodes}")
     
     successful_indices = torch.nonzero(success_mask).squeeze(-1)
@@ -62,6 +65,7 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
     else:
         successful_indices = successful_indices.tolist()
 
+    logger.debug(f"succesful indices : {successful_indices}")
     logger.debug(f"GPU Unification complete. {len(successful_indices)} pairs successfully unified.")
 
     
@@ -114,7 +118,7 @@ def compute_given_clause_resolvents_tensor(given_clause, processed_pool, pipelin
     arena_size_after = pipeline.parser.nodes.shape[0]
     nodes_made = arena_size_after - arena_size_before
     logger.debug(f"Arena Size AFTER Instantiation: {arena_size_after} nodes")
-    logger.debug(f"HIDDEN WORK: The GPU secretly made {nodes_made} new nodes to support roots {new_roots_flat}")
+    logger.debug(f"HIDDEN WORK: The GPU made {nodes_made} new nodes to support roots {new_roots_flat}")
     if nodes_made > 0:
         logger.debug(f"full nodes tensor: {pipeline.parser.nodes}")
         minted_nodes = pipeline.parser.nodes[arena_size_before:]

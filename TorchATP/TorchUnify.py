@@ -260,6 +260,100 @@ class ProverPipeline:
         subs, success_mask = unifier.unify(pair_batch)
         
         return subs, success_mask, unifier
+    
+
+    def instantiate(self, batched_requests, unifier):
+        """
+        A stripped-down instantiation purely for benchmarking.
+        It computes the substituted DAGs and allocates them in VRAM, 
+        but DOES NOT append them to the global arena.
+        """
+
+        if batched_requests.numel() == 0 or batched_requests.shape[0] == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+
+        # We still need to know where the global arena ends so our new 
+        # pointers don't accidentally overwrite existing axioms.
+        current_arena_size = self.parser.nodes.shape[0]
+        
+        original_b_idx = batched_requests[:, 0]
+        roots_old = batched_requests[:, 1]
+        
+        unique_batches, local_b_idx = torch.unique(original_b_idx, return_inverse=True)
+        num_unique_batches = unique_batches.shape[0]
+        
+        old_to_new = torch.full(
+            (num_unique_batches * current_arena_size,), -1, 
+            dtype=torch.long, device=self.device
+        )
+        
+        # 1. Apply root substitutions
+        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        root_keys = (local_b_idx * current_arena_size) + true_roots
+        
+        unique_root_keys = torch.unique(root_keys)
+        num_new_roots = unique_root_keys.numel()
+        
+        new_ids = torch.arange(current_arena_size, current_arena_size + num_new_roots, device=self.device)
+        old_to_new[unique_root_keys] = new_ids
+        next_alloc_idx = current_arena_size + num_new_roots
+        
+        frontier_keys = unique_root_keys
+        out_nodes, out_is_var, out_children = [], [], []
+        
+        # 2. Traverse and build the new subgraphs
+        while frontier_keys.numel() > 0:
+            current_local_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
+            current_nodes = frontier_keys % current_arena_size
+            
+            level_nodes = self.parser.nodes[current_nodes]
+            level_is_var = self.parser.is_var_mask[current_nodes]
+            level_children = self.parser.children[current_nodes] 
+            
+            valid_mask = level_children != -1
+            
+            if valid_mask.any():
+                expanded_local_b_idx = current_local_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
+                valid_local_b_idx = expanded_local_b_idx[valid_mask]
+                valid_children_old = level_children[valid_mask]
+                
+                valid_original_b_idx = unique_batches[valid_local_b_idx]
+                
+                # Query the substitution matrix
+                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
+                
+                child_keys = (valid_local_b_idx * current_arena_size) + true_children
+                unallocated_mask = old_to_new[child_keys] == -1
+                unallocated_keys = child_keys[unallocated_mask]
+                
+                unique_new_keys = torch.unique(unallocated_keys)
+                num_new_children = unique_new_keys.numel()
+                
+                if num_new_children > 0:
+                    new_child_ids = torch.arange(next_alloc_idx, next_alloc_idx + num_new_children, device=self.device)
+                    old_to_new[unique_new_keys] = new_child_ids
+                    next_alloc_idx += num_new_children
+                    
+                new_level_children = torch.full_like(level_children, -1)
+                new_level_children[valid_mask] = old_to_new[child_keys]
+                frontier_keys = unique_new_keys
+            else:
+                new_level_children = torch.full_like(level_children, -1)
+                frontier_keys = torch.empty(0, dtype=torch.long, device=self.device)
+                
+            out_nodes.append(level_nodes)
+            out_is_var.append(level_is_var)
+            out_children.append(new_level_children)
+            
+        if out_nodes:
+            ephemeral_nodes = torch.cat(out_nodes)
+            ephemeral_is_var = torch.cat(out_is_var)
+            ephemeral_children = torch.cat(out_children)
+            
+            
+            return old_to_new[root_keys], ephemeral_nodes, ephemeral_is_var, ephemeral_children
+            
+        return old_to_new[root_keys], None, None, None
 
     
 
@@ -268,34 +362,32 @@ class ProverPipeline:
         batched_requests: A 2D tensor of shape [R, 2] where R is the number of SUCCESSFUL requests. 
                           Column 0 is the original batch_idx (reality ID).
                           Column 1 is the root_idx to copy.
-
-        Although this function returns new_roots, it also crucially modifies the children
-        and nodes tensor. 
         """
-        if batched_requests.shape[0] == 0:
-            return []
 
-        current_arena_size = self.parser.arena_ptr
-        R = batched_requests.shape[0] # Only the amount of successful batches
+        if batched_requests.numel() == 0 or batched_requests.shape[0] == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+
+        current_arena_size = self.parser.nodes.shape[0]
         
-        # 2D memoization table
-        # Size: [R * current_arena_size] 
-        old_to_new = torch.full(
-            (R * current_arena_size,), -1, 
-            dtype=torch.long, device=self.device
-        )
-        
-        # Extract the absolute/original batch IDs (e.g., 5, 102, 24999)
         original_b_idx = batched_requests[:, 0]
         roots_old = batched_requests[:, 1]
         
-        # Create local IDs to compress the coordinate math (e.g., 0, 1, 2)
-        local_b_idx = torch.arange(R, dtype=torch.long, device=self.device)
+        
+        # Compress the true batch IDs into dense local coordinates [0, 1, 2...]
+        # This ensures all literals from the same batch share the same memoization layer.
+        unique_batches, local_b_idx = torch.unique(original_b_idx, return_inverse=True)
+        num_unique_batches = unique_batches.shape[0]
+        
+        # 2D memoization table scaled by unique realities, not request rows
+        old_to_new = torch.full(
+            (num_unique_batches * current_arena_size,), -1, 
+            dtype=torch.long, device=self.device
+        )
         
         # Update the reference of the roots
         true_roots = unifier.update_ref(roots_old, original_b_idx)
         
-        # Generate the unique flattened keys 
+        # Generate the unique flattened keys
         root_keys = (local_b_idx * current_arena_size) + true_roots
         
         # Allocate fresh indices for unique roots
@@ -310,7 +402,6 @@ class ProverPipeline:
         frontier_keys = unique_root_keys
         out_nodes, out_is_var, out_children = [], [], []
         
-        
         while frontier_keys.numel() > 0:
 
             # Decode the flat keys back into local 2D coordinates
@@ -320,7 +411,7 @@ class ProverPipeline:
             # Fetch structural data for the current batch of nodes
             level_nodes = self.parser.nodes[current_nodes]
             level_is_var = self.parser.is_var_mask[current_nodes]
-            level_children = self.parser.children[current_nodes] # Shape: [F, max_arity]
+            level_children = self.parser.children[current_nodes] 
             
             valid_mask = level_children != -1
             
@@ -331,11 +422,11 @@ class ProverPipeline:
                 valid_local_b_idx = expanded_local_b_idx[valid_mask]
                 valid_children_old = level_children[valid_mask]
                 
+                # --- THE SECOND FIX ---
+                # Retrieve the original batch ID using the unique_batches array, NOT original_b_idx
+                valid_original_b_idx = unique_batches[valid_local_b_idx]
                 
-                
-                valid_original_b_idx = original_b_idx[valid_local_b_idx]
                 true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
-                
                 
                 child_keys = (valid_local_b_idx * current_arena_size) + true_children
                 
@@ -346,13 +437,11 @@ class ProverPipeline:
                 unique_new_keys = torch.unique(unallocated_keys)
                 num_new_children = unique_new_keys.numel()
                 
-                
                 if num_new_children > 0:
                     new_child_ids = torch.arange(next_alloc_idx, next_alloc_idx + num_new_children, device=self.device)
                     old_to_new[unique_new_keys] = new_child_ids
                     next_alloc_idx += num_new_children
                     
-                
                 new_level_children = torch.full_like(level_children, -1)
                 new_level_children[valid_mask] = old_to_new[child_keys]
                 

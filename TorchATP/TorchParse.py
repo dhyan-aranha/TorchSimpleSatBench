@@ -14,6 +14,7 @@ class LogicParser:
         self.nodes = []
         self.children = []
         self.is_var_mask = []
+        
 
     def parse_clauses(self, clause_strings):
         """This will be used in the future when we want to standardize apart."""

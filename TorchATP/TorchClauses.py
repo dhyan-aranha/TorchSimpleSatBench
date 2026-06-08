@@ -66,6 +66,7 @@ class VirtualClause(Derivable):
     def deduplicate(self):
         self.literals = list(set(self.literals))
 
+
 def decode_virtual_clause(v_clause, pipeline):
     """
     Helper function to translate a VirtualClause (tuples) back to a string.

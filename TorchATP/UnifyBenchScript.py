@@ -35,13 +35,12 @@ TEN_PAIRS = [
 class ActualGPUProver:
     def __init__(self, device='cuda'):
         self.device = device
-        # max_arity=3 to handle formulas like p(a,b,c)
         self.pipeline = TorchUnify.NeuralProverPipeline(device=device, max_arity=3)
         
-        # Parse all 10 templates into the global arena at once
+       
         nodes, children, is_var, roots = self.pipeline.parser.parse_pairs(TEN_PAIRS)
         
-        # Execute the Tensor Transition (Seal the arena)
+       
         self.pipeline.parser.nodes = nodes.to(device)
         self.pipeline.parser.children = children.to(device)
         self.pipeline.parser.is_var_mask = is_var.to(device)
@@ -59,7 +58,6 @@ class ActualGPUProver:
         self.pipeline.parser.is_var_mask = self.pipeline.parser.is_var_mask[:self.initial_arena_size]
 
     def run_batched_tensor(self, batch_size):
-        # Repeat the 10 pairs enough times to fill the requested batch size
         multiplier = (batch_size // len(self.root_pairs)) + 1
         pair_indices = (self.root_pairs * multiplier)[:batch_size]
         
@@ -74,15 +72,19 @@ class ActualGPUProver:
             successful_indices = successful_indices.tolist()
             
         all_requests = []
-        # Request to instantiate the left root for all successful unifications
         for idx in successful_indices:
             left_root = pair_indices[idx][0]
             all_requests.append([idx, left_root])
             
         if all_requests:
             req_tensor = torch.tensor(all_requests, dtype=torch.long, device=self.device)
-            new_roots = self.pipeline.batched_instantiate_in_arena(req_tensor, unifier)
-            return new_roots
+            
+            # Call the ephemeral version!
+            new_roots, e_nodes, e_vars, e_children = self.pipeline.instantiate(req_tensor, unifier)
+            
+            # Return the ephemeral tensors so they aren't destroyed until the 
+            # timing block in run_colab_benchmark finishes.
+            return new_roots, e_nodes, e_vars, e_children
             
         return []
 
@@ -92,12 +94,10 @@ class ActualGPUProver:
             self.root_pairs, standardize_apart=False
         )
         
-        # --- THE COLAB-ONLY FIX ---
-        # Manually inject the missing attribute into the pipeline object 
-        # so print_report doesn't crash when it looks for it!
+        
         self.pipeline.last_run_standardized = False
         self.pipeline.batch_var_map_offset = 0
-        # --------------------------
+        
         
         # Use your custom built-in logger to decode the tensors
         self.pipeline.print_report(TEN_PAIRS, subs, success_mask, unifier)
