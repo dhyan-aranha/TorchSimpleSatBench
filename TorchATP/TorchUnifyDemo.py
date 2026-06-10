@@ -69,7 +69,7 @@ class TracedBatchedGPUUnifier(BatchedGPUUnifier):
             failed_occurs = failed_occurs | new_fails
             
             if new_fails.any():
-                logger.warning(f"  -> [occurs_check] CYCLE DETECTED in current wave!")
+                logger.warning(f"  -> [occurs_check] CYCLE DETECTED in current wave")
             
             active_rows = ~failed_occurs
             if not active_rows.any():
@@ -93,10 +93,10 @@ class TracedBatchedGPUUnifier(BatchedGPUUnifier):
 
     
     def unify(self, pair_batch):
-        logger.info(f"\n{'='*60}\n[unify] STARTING PARALLEL BATCH UNIFICATION\n{'='*60}")
+        logger.info(f"\n{'='*60}\n[unify] Starting unification...\n{'='*60}")
         
        
-        logger.info("--- STATIC MEMORY ARENA ---")
+        logger.info("--- Parsed representation of AST ---")
         logger.info(f"Nodes (Vocab IDs): {self.nodes.tolist()}")
         logger.info(f"Is_Var Mask:       {self.is_var_mask.tolist()}")
         logger.info(f"Children Matrix: \n{self.children}")
@@ -112,7 +112,7 @@ class TracedBatchedGPUUnifier(BatchedGPUUnifier):
         self.subs = base_subs.unsqueeze(0).expand(num_pairs, -1).clone()
         
         
-        logger.info(f"INITIAL SUBS TENSOR (Shape {self.subs.shape}):\n{self.subs}")
+        logger.info(f" Initial subs tensor (Shape {self.subs.shape}):\n{self.subs}")
         
         frontier = pair_batch
         wave = 0
@@ -266,6 +266,100 @@ class TracedProverPipeline(ProverPipeline):
         
         subs, success_mask = unifier.unify(pair_batch)
         return subs, success_mask, unifier
+    
+    def instantiate(self, batched_requests, unifier):
+        """
+        A stripped-down instantiation purely for benchmarking.
+        It computes the substituted DAGs and allocates them in VRAM, 
+        but DOES NOT append them to the global arena.
+        """
+
+        if batched_requests.numel() == 0 or batched_requests.shape[0] == 0:
+            logger.debug("No successful unifications to instantiate. Exiting graph copy early.")
+            return torch.empty(0, dtype=torch.long, device=self.device)
+
+        current_arena_size = self.parser.nodes.shape[0]
+        
+        original_b_idx = batched_requests[:, 0]
+        roots_old = batched_requests[:, 1]
+
+        logger.debug(f"Input Requests (Batch_ID, Root_ID): \n{batched_requests.tolist()}")
+        
+        unique_batches, local_b_idx = torch.unique(original_b_idx, return_inverse=True)
+        num_unique_batches = unique_batches.shape[0]
+        
+        old_to_new = torch.full(
+            (num_unique_batches * current_arena_size,), -1, 
+            dtype=torch.long, device=self.device
+        )
+        
+        # Apply root substitutions
+        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        root_keys = (local_b_idx * current_arena_size) + true_roots
+        
+        unique_root_keys = torch.unique(root_keys)
+        num_new_roots = unique_root_keys.numel()
+        
+        new_ids = torch.arange(current_arena_size, current_arena_size + num_new_roots, device=self.device)
+        old_to_new[unique_root_keys] = new_ids
+        next_alloc_idx = current_arena_size + num_new_roots
+        
+        frontier_keys = unique_root_keys
+        out_nodes, out_is_var, out_children = [], [], []
+        
+        # Traverse and build the new subgraphs
+        while frontier_keys.numel() > 0:
+            current_local_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
+            current_nodes = frontier_keys % current_arena_size
+            
+            level_nodes = self.parser.nodes[current_nodes]
+            level_is_var = self.parser.is_var_mask[current_nodes]
+            level_children = self.parser.children[current_nodes] 
+            
+            valid_mask = level_children != -1
+            
+            if valid_mask.any():
+                expanded_local_b_idx = current_local_b_idx.unsqueeze(1).expand(-1, self.parser.max_arity)
+                valid_local_b_idx = expanded_local_b_idx[valid_mask]
+                valid_children_old = level_children[valid_mask]
+                
+                valid_original_b_idx = unique_batches[valid_local_b_idx]
+                
+                # Query the substitution matrix
+                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
+                
+                child_keys = (valid_local_b_idx * current_arena_size) + true_children
+                unallocated_mask = old_to_new[child_keys] == -1
+                unallocated_keys = child_keys[unallocated_mask]
+                
+                unique_new_keys = torch.unique(unallocated_keys)
+                num_new_children = unique_new_keys.numel()
+                
+                if num_new_children > 0:
+                    new_child_ids = torch.arange(next_alloc_idx, next_alloc_idx + num_new_children, device=self.device)
+                    old_to_new[unique_new_keys] = new_child_ids
+                    next_alloc_idx += num_new_children
+                    
+                new_level_children = torch.full_like(level_children, -1)
+                new_level_children[valid_mask] = old_to_new[child_keys]
+                frontier_keys = unique_new_keys
+            else:
+                new_level_children = torch.full_like(level_children, -1)
+                frontier_keys = torch.empty(0, dtype=torch.long, device=self.device)
+                
+            out_nodes.append(level_nodes)
+            out_is_var.append(level_is_var)
+            out_children.append(new_level_children)
+            
+        if out_nodes:
+            ephemeral_nodes = torch.cat(out_nodes)
+            ephemeral_is_var = torch.cat(out_is_var)
+            ephemeral_children = torch.cat(out_children)
+            
+            
+            return old_to_new[root_keys], ephemeral_nodes, ephemeral_is_var, ephemeral_children
+            
+        return old_to_new[root_keys], None, None, None
 
     def batched_instantiate_in_arena(self, batched_requests, unifier):
         logger.info(f"\n{'='*60}\n[batched_instantiate] STARTING MEMORY ARENA GRAPH COPY\n{'='*60}")
@@ -385,7 +479,9 @@ class TracedProverPipeline(ProverPipeline):
         logger.debug(f"{indent}[decode_term] Reading physical node at memory index: {idx_int}")
         
         node_tensor = torch.tensor([idx_int], dtype=torch.long, device=self.device)
+        logger.debug(f"[decode_term] The idx_int tensor i.e. node_tensor is {node_tensor}")
         b_idx_tensor = torch.tensor([batch_idx], dtype=torch.long, device=self.device)
+        logger.debug(f"[decode_term] The b_idx_tensor is : {b_idx_tensor}")
         
         true_idx = unifier.update_ref(node_tensor, b_idx_tensor).item()
         
@@ -413,7 +509,7 @@ class TracedProverPipeline(ProverPipeline):
             logger.debug(f"{indent} -> Lookup FAILED: No original string for {true_idx}. Using fallback '{fallback_name}'")
             return fallback_name
             
-        # It's a Function or Constant!
+        # It's a function or constant
         sym_id = unifier.nodes[true_idx].item()
         sym_str = id_to_symbol.get(sym_id, "?")
         logger.debug(f"{indent} -> Node {true_idx} is a FUNCTION/CONSTANT. Vocab ID: {sym_id} -> String: '{sym_str}'")
@@ -434,6 +530,7 @@ class TracedProverPipeline(ProverPipeline):
             reconstructed = f"{sym_str}({', '.join(args)})"
             logger.debug(f"{indent} -> Assembled Sub-Tree: {reconstructed}")
             return reconstructed
+        
     def print_report(self, string_pairs, subs, success_mask, unifier):
         print("\n" + "="*60)
         print(f"Batch Unification Log")
@@ -462,9 +559,7 @@ class TracedProverPipeline(ProverPipeline):
                 else:
                     print("   -> Bindings:")
                     for var_name, var_memory_idx in combined_var_map.items():
-                        # THE FIX: Explicitly pass batch_idx=i using the keyword argument
                         bound_string = self.decode_term(var_memory_idx, unifier, id_to_symbol, combined_var_map, batch_idx=i)
-                        
                         if bound_string != var_name:
                             print(f"      {var_name} = {bound_string}")
             else:
@@ -483,7 +578,7 @@ if __name__ == "__main__":
         #("g(X)", "g(f(g(X),b))"),
         #("p(X,X,X)", "p(Y,Y,e)"),
         #("f(f(g(X),a),X)", "f(Y,g(Y))"),
-        ("f(f(g(X),a),g(X))", "f(Y,g(Z))"),
+        #("f(f(g(X),a),g(X))", "f(Y,g(Z))"),
         #("p(X,g(a), f(a, f(a)))", "p(f(a), g(Y), f(Y, Z))")
     ]
     
@@ -507,15 +602,13 @@ if __name__ == "__main__":
     for idx in successful_indices.tolist():
         left_root = root_pairs[idx][0].item()
         batched_requests.append([idx, left_root])
-        
+    
     batched_requests_tensor = torch.tensor(batched_requests, dtype=torch.long)
     new_roots = pipeline.batched_instantiate_in_arena(batched_requests_tensor, unifier)
     
     pipeline.print_report(string_pairs, subs, success_mask, unifier)
 
-
-    # --- SECTION 5: TRACING THE NEW GRAPH ---
-    logger.info(f"\n{'='*60}\n[Human Translation] READING THE NEW GRAPHS\n{'='*60}")
+    logger.info(f"\n{'='*60}\n [Translation back to strings] \n{'='*60}")
     
     logger.debug("Creating a 'Dummy Unifier' (Clean Identity Matrix).")
     logger.debug("Because the pointers are now physically wired together in the VRAM arena, we DO NOT want to apply the old substitutions. We just read the physical edges directly.")
@@ -527,8 +620,11 @@ if __name__ == "__main__":
     )
 
     new_roots_list = new_roots.tolist()
+    logger.debug(f"New roots {new_roots_list}")
     id_to_symbol = {v: k for k, v in pipeline.parser.global_vocab.items()}
+    logger.debug(f"global dictionary: {id_to_symbol}")
     offset = getattr(pipeline, 'batch_var_map_offset', 0)
+    logger.debug(f" The offset : {offset}")
 
     for i, orig_batch_idx in enumerate(successful_indices.tolist()):
         new_root = new_roots_list[i]
@@ -538,6 +634,7 @@ if __name__ == "__main__":
         logger.debug(f"Target Root Index to decode: {new_root}")
         
         if not pipeline.last_run_standardized:
+            logger.debug(f"{pipeline.parser.var_maps}")
             combined_var_map = pipeline.parser.var_maps[offset + orig_batch_idx]
             logger.debug(f"Translation Dictionary (Single Clause): {combined_var_map}")
         else:

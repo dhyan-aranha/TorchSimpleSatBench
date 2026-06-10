@@ -272,8 +272,6 @@ class ProverPipeline:
         if batched_requests.numel() == 0 or batched_requests.shape[0] == 0:
             return torch.empty(0, dtype=torch.long, device=self.device)
 
-        # We still need to know where the global arena ends so our new 
-        # pointers don't accidentally overwrite existing axioms.
         current_arena_size = self.parser.nodes.shape[0]
         
         original_b_idx = batched_requests[:, 0]
@@ -287,7 +285,7 @@ class ProverPipeline:
             dtype=torch.long, device=self.device
         )
         
-        # 1. Apply root substitutions
+        # Apply root substitutions
         true_roots = unifier.update_ref(roots_old, original_b_idx)
         root_keys = (local_b_idx * current_arena_size) + true_roots
         
@@ -301,7 +299,7 @@ class ProverPipeline:
         frontier_keys = unique_root_keys
         out_nodes, out_is_var, out_children = [], [], []
         
-        # 2. Traverse and build the new subgraphs
+        # Traverse and build the new subgraphs
         while frontier_keys.numel() > 0:
             current_local_b_idx = torch.div(frontier_keys, current_arena_size, rounding_mode='floor')
             current_nodes = frontier_keys % current_arena_size
@@ -378,7 +376,7 @@ class ProverPipeline:
         unique_batches, local_b_idx = torch.unique(original_b_idx, return_inverse=True)
         num_unique_batches = unique_batches.shape[0]
         
-        # 2D memoization table scaled by unique realities, not request rows
+        # 2D memoization table
         old_to_new = torch.full(
             (num_unique_batches * current_arena_size,), -1, 
             dtype=torch.long, device=self.device

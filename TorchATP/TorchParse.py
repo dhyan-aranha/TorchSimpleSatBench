@@ -9,6 +9,7 @@ class LogicParser:
         
         self.max_arity = 0
 
+        # List of dictionaries
         self.var_maps = []
         
         self.nodes = []

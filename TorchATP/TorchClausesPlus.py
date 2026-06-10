@@ -132,7 +132,6 @@ def parse_tptp_to_virtual_clause(tptp_str, pipeline):
     
     match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*\((.*)\)\s*\)\.?", tptp_str.strip())
     if not match:
-        
         match = re.match(r"cnf\(([^,]+),\s*[^,]+,\s*(.*)\)\.?", tptp_str.strip())
         
     if not match:
