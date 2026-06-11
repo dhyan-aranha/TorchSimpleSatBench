@@ -467,7 +467,8 @@ class TracedProverPipeline(ProverPipeline):
             total_added = sum(n.shape[0] for n in out_nodes)
             logger.info(f"Successfully appended {total_added} total nodes to the global arena.")
             
-            
+        print(f"Nodes : {self.parser.nodes}")
+        print(f"Children : {self.parser.children}")           
         return old_to_new[root_keys]
     
     def decode_term(self, idx, unifier, id_to_symbol, var_name_map, visited=None, batch_idx=0, depth=0):
@@ -572,9 +573,9 @@ if __name__ == "__main__":
         #("X", "a"),
         #("X", "f(X)"),
         #("X", "f(Y)"),
-        ("f(X, a)", "f(b, Y)"),
+        ("f(g(X,Y), h(a, b))", "f(g(X, a)), h(Y, X))"),
         #("f(X, g(a))", "f(X, Y)"), 
-        ("f(X, g(a))", "f(X, X)"), 
+        #("f(X, g(a))", "f(X, X)"), 
         #("g(X)", "g(f(g(X),b))"),
         #("p(X,X,X)", "p(Y,Y,e)"),
         #("f(f(g(X),a),X)", "f(Y,g(Y))"),
