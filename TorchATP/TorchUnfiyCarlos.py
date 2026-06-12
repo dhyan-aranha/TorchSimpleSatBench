@@ -1,14 +1,7 @@
-# A version of torch unify with a custom CUDA kernels handling, pointer chasing and unification. 
 import torch
 import math
 from TorchParse import LogicParser
-from torch.utils.cpp_extension import load
 
-cuda_unify = load(
-    name="cuda_unify", 
-    sources=["unify_kernel.cu"], 
-    verbose=True
-)
 
 class BatchedGPUUnifier:
     def __init__(self, nodes, children, is_var_mask, max_arity):
@@ -21,23 +14,38 @@ class BatchedGPUUnifier:
 
     def update_ref(self, indices, b_idx):
         """
-        Maintains standard PyTorch behavior for small queries 
-        (used by occurs_check and instantiate).
+        Follows the substitution chain. If it loops longer than the total
+        number of nodes, a cycle is detected and aborted safely.
         """
         curr = indices.clone()
         valid_mask = (curr != -1)
         active = valid_mask.clone()
         
+        step_counter = 0
+        cycle_mask = torch.zeros_like(active, dtype=torch.bool)
+        
         while active.any():
+            
+            # Flaging cycles
+            if step_counter > self.num_nodes:
+                cycle_mask = active.clone()
+                break
+                
             nxt = curr.clone()
             nxt[active] = self.subs[b_idx[active], curr[active]]
+            
             changed = (nxt != curr) & active
             curr = nxt
             active = changed
+            step_counter += 1
             
-        return curr
+        return curr, cycle_mask
     
     def occurs_check(self, var_indices, target_indices, b_idx):
+        """
+        Dynamically bounds the Breadth-First Search.
+        Now safely threads the batch index down into update_ref.
+        """
         K = var_indices.shape[0]
         if K == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.nodes.device)
@@ -45,9 +53,11 @@ class BatchedGPUUnifier:
         device = self.nodes.device
         failed_occurs = torch.zeros(K, dtype=torch.bool, device=device)
         
+        # Initial shape: [K, 1]
         frontier = target_indices.unsqueeze(1) 
         
         while frontier.shape[1] > 0:
+            
             flat_frontier = frontier.flatten()
             flat_b_idx = b_idx.unsqueeze(1).expand(-1, frontier.shape[1]).flatten()
             
@@ -75,77 +85,162 @@ class BatchedGPUUnifier:
             frontier = frontier[:, col_has_data]
 
         return failed_occurs
-
-    def unify(self, pair_batch):
+    
+    def _unify_core(self, pair_batch, fast_mode=False):
+        """
+        The core unification loop.
+        If fast_mode=True, it skips the expensive occurs check.
+        """
         num_pairs = pair_batch.shape[0]
-
-        global_success_mask = torch.ones(num_pairs, dtype=torch.bool, device=self.nodes.device)
+        success_mask = torch.ones(num_pairs, dtype=torch.bool, device=self.nodes.device)
+        batch_idx = torch.arange(num_pairs, dtype=torch.long, device=self.nodes.device)
+        
         base_subs = torch.arange(self.num_nodes, dtype=torch.long, device=self.nodes.device)
+        self.subs = base_subs.unsqueeze(0).expand(num_pairs, -1).clone()
         
-        # 1. Cast ALL matrices to int32 for C++ compatibility upfront
-        subs_int32 = base_subs.unsqueeze(0).expand(num_pairs, -1).clone().to(torch.int32).contiguous()
-        c_nodes = self.nodes.to(torch.int32).contiguous()
-        c_children = self.children.to(torch.int32).contiguous()
+        frontier = pair_batch
         
-        frontier_left = pair_batch[:, 0].to(torch.int32)
-        frontier_right = pair_batch[:, 1].to(torch.int32)
-        batch_idx_int32 = torch.arange(num_pairs, dtype=torch.int32, device=self.nodes.device)
-        
-        while frontier_left.shape[0] > 0:
-            alive_mask = global_success_mask[batch_idx_int32]
-            frontier_left = frontier_left[alive_mask]
-            frontier_right = frontier_right[alive_mask]
-            current_batch_idx = batch_idx_int32[alive_mask]
+        while frontier.shape[0] > 0:
+            alive_mask = success_mask[batch_idx]
+            frontier = frontier[alive_mask]
+            batch_idx = batch_idx[alive_mask]
             
-            if frontier_left.shape[0] == 0: break
+            if frontier.shape[0] == 0: break
             
-            # 2. Fully compress the DAG using update_ref_kernel
-            subs_int32 = cuda_unify.launch_update_ref(subs_int32, self.num_nodes)
+            left, l_cycles = self.update_ref(frontier[:, 0], batch_idx)
+            right, r_cycles = self.update_ref(frontier[:, 1], batch_idx)
             
-            # Since subs_int32 is now completely flat, finding roots is a direct 2D read
-            left_roots = subs_int32[current_batch_idx, frontier_left]
-            right_roots = subs_int32[current_batch_idx, frontier_right]
+            # If we hit a cycle during pointer chasing, flag the batch as failed
+            combined_cycles = l_cycles | r_cycles
+            if combined_cycles.any():
+                success_mask[batch_idx[combined_cycles]] = False
             
-            # 3. Execute atomic bindings and discover collisions
-            wave_success, next_left, next_right, next_batch = cuda_unify.launch_unify(
-                left_roots, 
-                right_roots, 
-                current_batch_idx, 
-                subs_int32,  # Modified in-place via atomicCAS!
-                self.is_var_mask, 
-                c_nodes, 
-                c_children, 
-                self.num_nodes, 
-                self.max_arity
-            )
+            active = (left != right) & ~combined_cycles
+            left, right = left[active], right[active]
+            batch_idx = batch_idx[active] 
             
-            global_success_mask[current_batch_idx[~wave_success]] = False
+            if left.shape[0] == 0: break
             
-            frontier_left = next_left
-            frontier_right = next_right
-            batch_idx_int32 = next_batch
+            l_is_v = self.is_var_mask[left]
+            r_is_v = self.is_var_mask[right]
+            
+            next_frontier_pieces = []
+            next_batch_pieces = []
+            
+            is_var_pair = l_is_v | r_is_v
+            
+            if torch.any(is_var_pair):
+                v_left, v_right = left[is_var_pair], right[is_var_pair]
+                v_l_is_v = l_is_v[is_var_pair]
+                
+                v_idx = torch.where(v_l_is_v, v_left, v_right)
+                t_idx = torch.where(v_l_is_v, v_right, v_left)
+                b_idx_all = batch_idx[is_var_pair]
+                
+                composite_keys = (b_idx_all * self.num_nodes) + v_idx
+                
+                unique_keys, inverse_indices = torch.unique(composite_keys, return_inverse=True)
+                idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
+                
+                first_occ_idx = torch.zeros(len(unique_keys), dtype=torch.long, device=self.nodes.device)
+                first_occ_idx.scatter_(0, inverse_indices.flip(0), idx_seq.flip(0))
+                
+                process_v = v_idx[first_occ_idx]
+                process_t = t_idx[first_occ_idx]
+                process_b = b_idx_all[first_occ_idx]
+                
+                deferred_mask = torch.ones(len(b_idx_all), dtype=torch.bool, device=self.nodes.device)
+                deferred_mask[first_occ_idx] = False
+                
+                if torch.any(deferred_mask):
+                    next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
+                    next_batch_pieces.append(b_idx_all[deferred_mask])
+                    
+                
+                if not fast_mode:
+                    failed_occurs = self.occurs_check(process_v, process_t, process_b)
+                    if torch.any(failed_occurs):
+                        success_mask[process_b[failed_occurs]] = False
+                    survivors = ~failed_occurs
+                else:
+                    survivors = torch.ones_like(process_v, dtype=torch.bool)
+                
+                s_v, s_t, s_b = process_v[survivors], process_t[survivors], process_b[survivors]
+                if s_v.shape[0] > 0:
+                    self.subs[s_b, s_v] = s_t
+                
+            fun_mask = ~is_var_pair
+            if torch.any(fun_mask):
+                f_left, f_right = left[fun_mask], right[fun_mask]
+                f_batch = batch_idx[fun_mask]
+                
+                mismatch = (self.nodes[f_left] != self.nodes[f_right])
+                if torch.any(mismatch):
+                    success_mask[f_batch[mismatch]] = False
+                
+                valid_struct = ~mismatch
+                f_left, f_right = f_left[valid_struct], f_right[valid_struct]
+                f_batch = f_batch[valid_struct]
+                
+                if f_left.shape[0] > 0:
+                    c_left, c_right = self.children[f_left], self.children[f_right]
+                    c_batch = f_batch.unsqueeze(1).expand(-1, self.max_arity).flatten()
+                    c_left, c_right = c_left.flatten(), c_right.flatten()
+                    
+                    valid_pad = (c_left != -1) & (c_right != -1)
+                    if torch.any(valid_pad):
+                        next_frontier_pieces.append(torch.stack([c_left[valid_pad], c_right[valid_pad]], dim=1))
+                        next_batch_pieces.append(c_batch[valid_pad])
+            
+            if len(next_frontier_pieces) > 0:
+                frontier = torch.cat(next_frontier_pieces, dim=0)
+                batch_idx = torch.cat(next_batch_pieces, dim=0)
+            else:
+                frontier = torch.empty((0, 2), dtype=torch.long, device=self.nodes.device)
 
-        # 4. Save the fully resolved matrix back as standard PyTorch longs
-        self.subs = subs_int32.to(torch.long)
+        return self.subs.clone(), success_mask.clone()
+
+    def tiered_unify(self, pair_batch):
+        device = self.nodes.device
+        num_pairs = pair_batch.shape[0]
         
-        bound_mask = self.subs != base_subs.unsqueeze(0).expand(num_pairs, -1)
+        # Greedy binding
+        fast_subs, fast_success = self._unify_core(pair_batch, fast_mode=True)
+        
+        # verification
+        base_subs = torch.arange(self.num_nodes, dtype=torch.long, device=device).unsqueeze(0).expand(num_pairs, -1)
+        bound_mask = (fast_subs != base_subs) & fast_success.unsqueeze(1)
+        
         b_idx, v_idx = torch.where(bound_mask)
-        t_idx = self.subs[bound_mask]
         
-        failed_occurs = self.occurs_check(v_idx, t_idx, b_idx)
+        # Temporarily load fast subs for the verification checks
+        self.subs = fast_subs 
         
-        if torch.any(failed_occurs):
-            global_success_mask[b_idx[failed_occurs]] = False
-
-        return self.subs, global_success_mask
-
-
-class ProverPipeline:
-    def __init__(self, device='cpu', max_arity=0):
-        self.device = device
-        self.parser = LogicParser()
-        if max_arity > 0:
-            self.parser.max_arity = max_arity
+        # Catch cycles
+        _, ref_cycle_mask = self.update_ref(v_idx, b_idx)
+        
+        # Catch things like f(X,Y) = f(g(Y), g(X))
+        t_idx = fast_subs[b_idx, v_idx]
+        struct_cycle_mask = self.occurs_check(v_idx, t_idx, b_idx)
+        
+        # Combine both failure types into a single Soft Fail mask
+        soft_fail_mask = ref_cycle_mask | struct_cycle_mask
+        
+        soft_fail_batches = torch.unique(b_idx[soft_fail_mask])
+        
+        if soft_fail_batches.shape[0] == 0:
+            return self.subs, fast_success
+            
+        # Safely attempt unifaction
+        slow_pair_batch = pair_batch[soft_fail_batches]
+        slow_subs, slow_success = self._unify_core(slow_pair_batch, fast_mode=False)
+        
+        # Merge results
+        fast_subs[soft_fail_batches] = slow_subs
+        fast_success[soft_fail_batches] = slow_success
+        
+        self.subs = fast_subs
+        return self.subs, fast_success
     
 # Auxiliary class 
 class SingleUnifierWrapper:
@@ -177,16 +272,9 @@ class ProverPipeline:
 
     
     def prove_batch_indices(self, pair_indices, standardize_apart=True):
-        """
-        Executes batched unification using purely integer memory pointers.
-        Bypasses string parsing entirely for maximum performance.
-        
-        pair_indices: A list of tuples like [(root_idx_1, root_idx_2), ...]
-        """
         if not pair_indices:
             return torch.empty(0), torch.empty(0), None
 
-        # Convert the list of tuples into a [Batch_Size, 2] PyTorch tensor
         pair_batch = torch.tensor(pair_indices, dtype=torch.long, device=self.device)
         
         unifier = BatchedGPUUnifier(
@@ -196,7 +284,8 @@ class ProverPipeline:
             max_arity=self.parser.max_arity
         )
         
-        subs, success_mask = unifier.unify(pair_batch)
+        
+        subs, success_mask = unifier.tiered_unify(pair_batch)
         
         return subs, success_mask, unifier
     
