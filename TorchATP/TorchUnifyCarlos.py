@@ -89,7 +89,7 @@ class BatchedGPUUnifier:
     def _unify_core(self, pair_batch, fast_mode=False):
         """
         The core unification loop.
-        If fast_mode=True, it skips the expensive occurs check.
+        Uses optimistic hardware scatter writes instead of torch.unique for maximum throughput.
         """
         num_pairs = pair_batch.shape[0]
         success_mask = torch.ones(num_pairs, dtype=torch.bool, device=self.nodes.device)
@@ -133,41 +133,36 @@ class BatchedGPUUnifier:
                 v_left, v_right = left[is_var_pair], right[is_var_pair]
                 v_l_is_v = l_is_v[is_var_pair]
                 
+                # Normalize so v_idx is ALWAYS the variable and t_idx is the target
                 v_idx = torch.where(v_l_is_v, v_left, v_right)
                 t_idx = torch.where(v_l_is_v, v_right, v_left)
                 b_idx_all = batch_idx[is_var_pair]
                 
-                composite_keys = (b_idx_all * self.num_nodes) + v_idx
-                
-                unique_keys, inverse_indices = torch.unique(composite_keys, return_inverse=True)
-                idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
-                
-                first_occ_idx = torch.zeros(len(unique_keys), dtype=torch.long, device=self.nodes.device)
-                first_occ_idx.scatter_(0, inverse_indices.flip(0), idx_seq.flip(0))
-                
-                process_v = v_idx[first_occ_idx]
-                process_t = t_idx[first_occ_idx]
-                process_b = b_idx_all[first_occ_idx]
-                
-                deferred_mask = torch.ones(len(b_idx_all), dtype=torch.bool, device=self.nodes.device)
-                deferred_mask[first_occ_idx] = False
-                
-                if torch.any(deferred_mask):
-                    next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
-                    next_batch_pieces.append(b_idx_all[deferred_mask])
-                    
-                
+                # ---- OPTIMISTIC SEPARATION & OCCURS CHECK ----
                 if not fast_mode:
-                    failed_occurs = self.occurs_check(process_v, process_t, process_b)
+                    failed_occurs = self.occurs_check(v_idx, t_idx, b_idx_all)
                     if torch.any(failed_occurs):
-                        success_mask[process_b[failed_occurs]] = False
+                        success_mask[b_idx_all[failed_occurs]] = False
                     survivors = ~failed_occurs
-                else:
-                    survivors = torch.ones_like(process_v, dtype=torch.bool)
+                    v_idx, t_idx, b_idx_all = v_idx[survivors], t_idx[survivors], b_idx_all[survivors]
                 
-                s_v, s_t, s_b = process_v[survivors], process_t[survivors], process_b[survivors]
-                if s_v.shape[0] > 0:
-                    self.subs[s_b, s_v] = s_t
+                if v_idx.shape[0] > 0:
+                    # Let the gpu race
+                    self.subs[b_idx_all, v_idx] = t_idx
+                    
+                    # Read back who actually won the race
+                    won_targets = self.subs[b_idx_all, v_idx]
+                    conflict_mask = (won_targets != t_idx)
+                    
+                    #  If our target wasn't written, we lost the race.
+                    if torch.any(conflict_mask):
+                        # The losing pair is: (What actually won, What we wanted to write)
+                        c_left = won_targets[conflict_mask]
+                        c_right = t_idx[conflict_mask]
+                        c_batch = b_idx_all[conflict_mask]
+                        
+                        next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
+                        next_batch_pieces.append(c_batch)
                 
             fun_mask = ~is_var_pair
             if torch.any(fun_mask):

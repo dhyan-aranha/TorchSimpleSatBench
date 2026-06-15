@@ -5,8 +5,7 @@ import os
 
 # Ensure the local workspace is in the path if running from a sub-directory
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-
-# Import your core pipeline modules
+import TorchUnifyCarlos
 import TorchUnifyPlus
 # import TorchSat  # Uncomment this when you integrate the resolution tests
 
