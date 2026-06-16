@@ -37,13 +37,13 @@ class BatchedGPUUnifier:
         failed_occurs = torch.zeros(K, dtype=torch.bool, device=device)
         
         frontier = target_indices.unsqueeze(1) 
-        step_counter = 0  # <--- NEW: Cycle breaker tracker
+        step_counter = 0 
         
         while frontier.shape[1] > 0:
             
-            # --- THE FIX ---
+            
             # If the BFS runs longer than the total arena size, we are stuck in a structural loop!
-            if step_counter > 50:  # Hardcap for BFS depth
+            if step_counter > 10:  # Hardcap for BFS depth
                 active_rows = (frontier != -1).any(dim=1)
                 failed_occurs = failed_occurs | active_rows
                 break
@@ -74,7 +74,7 @@ class BatchedGPUUnifier:
             col_has_data = (frontier != -1).any(dim=0)
             frontier = frontier[:, col_has_data]
             
-            step_counter += 1  # <--- NEW: Increment tracker
+            step_counter += 1  
             
         return failed_occurs
     

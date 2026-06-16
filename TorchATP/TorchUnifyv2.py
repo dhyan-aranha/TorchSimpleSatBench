@@ -36,13 +36,25 @@ class BatchedGPUUnifier:
             if hare_valid.any():
                 nxt_hare[hare_valid] = self.subs[b_idx[hare_valid], nxt_hare[hare_valid]]
             
-            # 3. Check collision
-            is_cycle = active & (nxt_tort == nxt_hare) & (nxt_tort != -1)
-            if is_cycle.any():
-                cycle_mask[is_cycle] = True
-                active[is_cycle] = False 
-                
+            # 3. Did Tortoise move? If not, it hit a root cleanly.
             changed = (nxt_tort != tort) & active
+            
+            # 4. Check collision
+            collision = changed & (nxt_tort == nxt_hare) & (nxt_tort != -1)
+            
+            if collision.any():
+                # A collision is a true cycle ONLY if the node they collided on 
+                # does not point to itself (i.e., it is not a root)
+                collided_next = self.subs[b_idx[collision], nxt_tort[collision]]
+                is_true_cycle = (collided_next != nxt_tort[collision])
+                
+                # Re-map back to the full boolean mask
+                true_cycle_mask = torch.zeros_like(active)
+                true_cycle_mask[collision] = is_true_cycle
+                
+                cycle_mask[true_cycle_mask] = True
+                changed[true_cycle_mask] = False  # Kill the cyclic lanes instantly
+                
             tort = nxt_tort
             hare = nxt_hare
             active = changed
@@ -478,7 +490,9 @@ class ProverPipeline:
         node_tensor = torch.tensor([idx_int], dtype=torch.long, device=self.device)
         b_idx_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
         
-        true_idx, _ = unifier.update_ref(node_tensor, b_idx_tensor).item()
+        # Safely unpack the tuple, then extract the scalar item
+        true_root_tensor, _ = unifier.update_ref(node_tensor, b_idx_tensor)
+        true_idx = true_root_tensor.item()
         
         
         if true_idx in visited:
