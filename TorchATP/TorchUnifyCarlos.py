@@ -13,39 +13,21 @@ class BatchedGPUUnifier:
         self.subs = torch.arange(self.num_nodes, dtype=torch.long, device=nodes.device).unsqueeze(0)
 
     def update_ref(self, indices, b_idx):
-        """
-        Follows the substitution chain. If it loops longer than the total
-        number of nodes, a cycle is detected and aborted safely.
-        """
         curr = indices.clone()
         valid_mask = (curr != -1)
         active = valid_mask.clone()
         
-        step_counter = 0
-        cycle_mask = torch.zeros_like(active, dtype=torch.bool)
-        
         while active.any():
-            
-            # Flaging cycles
-            if step_counter > self.num_nodes:
-                cycle_mask = active.clone()
-                break
-                
             nxt = curr.clone()
             nxt[active] = self.subs[b_idx[active], curr[active]]
             
             changed = (nxt != curr) & active
             curr = nxt
             active = changed
-            step_counter += 1
             
-        return curr, cycle_mask
+        return curr
     
     def occurs_check(self, var_indices, target_indices, b_idx):
-        """
-        Dynamically bounds the Breadth-First Search.
-        Now safely threads the batch index down into update_ref.
-        """
         K = var_indices.shape[0]
         if K == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.nodes.device)
@@ -53,15 +35,22 @@ class BatchedGPUUnifier:
         device = self.nodes.device
         failed_occurs = torch.zeros(K, dtype=torch.bool, device=device)
         
-        # Initial shape: [K, 1]
         frontier = target_indices.unsqueeze(1) 
+        step_counter = 0  # <--- NEW: Cycle breaker tracker
         
         while frontier.shape[1] > 0:
+            
+            # --- THE FIX ---
+            # If the BFS runs longer than the total arena size, we are stuck in a structural loop!
+            if step_counter > 50:  # Hardcap for BFS depth
+                active_rows = (frontier != -1).any(dim=1)
+                failed_occurs = failed_occurs | active_rows
+                break
             
             flat_frontier = frontier.flatten()
             flat_b_idx = b_idx.unsqueeze(1).expand(-1, frontier.shape[1]).flatten()
             
-            flat_updated = self.update_ref(flat_frontier, flat_b_idx)
+            flat_updated, _ = self.update_ref(flat_frontier, flat_b_idx)
             frontier = flat_updated.view(K, -1)
             
             matches = (frontier == var_indices.unsqueeze(1))
@@ -83,7 +72,9 @@ class BatchedGPUUnifier:
             
             col_has_data = (frontier != -1).any(dim=0)
             frontier = frontier[:, col_has_data]
-
+            
+            step_counter += 1  # <--- NEW: Increment tracker
+            
         return failed_occurs
     
     def _unify_core(self, pair_batch, fast_mode=False):
@@ -133,13 +124,33 @@ class BatchedGPUUnifier:
                 v_left, v_right = left[is_var_pair], right[is_var_pair]
                 v_l_is_v = l_is_v[is_var_pair]
                 
-                # Normalize so v_idx is ALWAYS the variable and t_idx is the target
                 v_idx = torch.where(v_l_is_v, v_left, v_right)
                 t_idx = torch.where(v_l_is_v, v_right, v_left)
                 b_idx_all = batch_idx[is_var_pair]
                 
-                # ---- OPTIMISTIC SEPARATION & OCCURS CHECK ----
+                # ---- THE SLOW MODE FIX ----
                 if not fast_mode:
+                    # SLOW MODE: Restrict to ONE variable per batch per wave to catch mutual cycles.
+                    # We defer all other variables in the same batch to the next wave.
+                    unique_b, inverse_indices = torch.unique(b_idx_all, return_inverse=True)
+                    idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
+                    
+                    first_occ_idx = torch.zeros(len(unique_b), dtype=torch.long, device=self.nodes.device)
+                    first_occ_idx.scatter_(0, inverse_indices.flip(0), idx_seq.flip(0))
+                    
+                    deferred_mask = torch.ones(len(b_idx_all), dtype=torch.bool, device=self.nodes.device)
+                    deferred_mask[first_occ_idx] = False
+                    
+                    if torch.any(deferred_mask):
+                        next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
+                        next_batch_pieces.append(b_idx_all[deferred_mask])
+                        
+                    # Filter down to just the single winning variable
+                    v_idx = v_idx[first_occ_idx]
+                    t_idx = t_idx[first_occ_idx]
+                    b_idx_all = b_idx_all[first_occ_idx]
+                
+                    # Now run the rigorous occurs check
                     failed_occurs = self.occurs_check(v_idx, t_idx, b_idx_all)
                     if torch.any(failed_occurs):
                         success_mask[b_idx_all[failed_occurs]] = False
@@ -154,9 +165,8 @@ class BatchedGPUUnifier:
                     won_targets = self.subs[b_idx_all, v_idx]
                     conflict_mask = (won_targets != t_idx)
                     
-                    #  If our target wasn't written, we lost the race.
+                    # If our target wasn't written, we lost the race.
                     if torch.any(conflict_mask):
-                        # The losing pair is: (What actually won, What we wanted to write)
                         c_left = won_targets[conflict_mask]
                         c_right = t_idx[conflict_mask]
                         c_batch = b_idx_all[conflict_mask]
@@ -199,35 +209,46 @@ class BatchedGPUUnifier:
         device = self.nodes.device
         num_pairs = pair_batch.shape[0]
         
-        # Greedy binding
+        # 1. Greedy binding (Fast Path)
         fast_subs, fast_success = self._unify_core(pair_batch, fast_mode=True)
         
-        # verification
+        # 2. Verification Phase
         base_subs = torch.arange(self.num_nodes, dtype=torch.long, device=device).unsqueeze(0).expand(num_pairs, -1)
         bound_mask = (fast_subs != base_subs) & fast_success.unsqueeze(1)
         
         b_idx, v_idx = torch.where(bound_mask)
         
-        # Temporarily load fast subs for the verification checks
-        self.subs = fast_subs 
+
+        # Cycle checking
+        # Hop 1
+        hop1 = fast_subs[b_idx, v_idx]
         
-        # Catch cycles
-        _, ref_cycle_mask = self.update_ref(v_idx, b_idx)
+        # Hop 2: Look up where that target points to in the exact same reality row
+        hop2 = fast_subs[b_idx, hop1]
         
-        # Catch things like f(X,Y) = f(g(Y), g(X))
-        t_idx = fast_subs[b_idx, v_idx]
-        struct_cycle_mask = self.occurs_check(v_idx, t_idx, b_idx)
+        # If Hop 2 points back to our starting variable, a variable cycle is exposed!
+        ref_cycle_mask = (hop2 == v_idx) & (v_idx != hop1)
         
-        # Combine both failure types into a single Soft Fail mask
+        struct_cycle_mask = self.occurs_check(v_idx, hop1, b_idx)
+        
+        # Combine failures to isolate the soft-fail batches
         soft_fail_mask = ref_cycle_mask | struct_cycle_mask
-        
         soft_fail_batches = torch.unique(b_idx[soft_fail_mask])
         
         if soft_fail_batches.shape[0] == 0:
+            self.subs = fast_subs
             return self.subs, fast_success
             
-        # Safely attempt unifaction
+        # 3. Clean Slate Slow Path Rescue
         slow_pair_batch = pair_batch[soft_fail_batches]
+        num_slow = slow_pair_batch.shape[0]
+        
+        # Reset the substitution slate for failed rows to identity matrices
+        clean_slow_subs = torch.arange(self.num_nodes, dtype=torch.long, device=device).unsqueeze(0).expand(num_slow, -1).clone()
+        fast_subs[soft_fail_batches] = clean_slow_subs
+        self.subs = fast_subs
+        
+        # Run rigorous slow mode on isolated lanes
         slow_subs, slow_success = self._unify_core(slow_pair_batch, fast_mode=False)
         
         # Merge results
@@ -309,7 +330,7 @@ class ProverPipeline:
         )
         
         # Apply root substitutions
-        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        true_roots, _ = unifier.update_ref(roots_old, original_b_idx)
         root_keys = (local_b_idx * current_arena_size) + true_roots
         
         unique_root_keys = torch.unique(root_keys)
@@ -341,7 +362,7 @@ class ProverPipeline:
                 valid_original_b_idx = unique_batches[valid_local_b_idx]
                 
                 # Query the substitution matrix
-                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
+                true_children,_ = unifier.update_ref(valid_children_old, valid_original_b_idx)
                 
                 child_keys = (valid_local_b_idx * current_arena_size) + true_children
                 unallocated_mask = old_to_new[child_keys] == -1
@@ -406,7 +427,7 @@ class ProverPipeline:
         )
         
         # Update the reference of the roots
-        true_roots = unifier.update_ref(roots_old, original_b_idx)
+        true_roots,_ = unifier.update_ref(roots_old, original_b_idx)
         
         # Generate the unique flattened keys
         root_keys = (local_b_idx * current_arena_size) + true_roots
@@ -447,7 +468,7 @@ class ProverPipeline:
                 # Retrieve the original batch ID using the unique_batches array, NOT original_b_idx
                 valid_original_b_idx = unique_batches[valid_local_b_idx]
                 
-                true_children = unifier.update_ref(valid_children_old, valid_original_b_idx)
+                true_children, _ = unifier.update_ref(valid_children_old, valid_original_b_idx)
                 
                 child_keys = (valid_local_b_idx * current_arena_size) + true_children
                 
@@ -483,33 +504,29 @@ class ProverPipeline:
         # Return new roots
         return old_to_new[root_keys]
     
-    def decode_term(self, idx, unifier, id_to_symbol, var_name_map, visited=None):
+    def decode_term(self, idx, unifier, id_to_symbol, var_name_map, batch_index=0, visited=None):
         if visited is None:
             visited = set()
             
         idx_int = int(idx) if isinstance(idx, torch.Tensor) else int(idx)
         
-        
         node_tensor = torch.tensor([idx_int], dtype=torch.long, device=self.device)
-        b_idx_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
+        b_idx_tensor = torch.tensor([batch_index], dtype=torch.long, device=self.device) 
         
-        true_idx = unifier.update_ref(node_tensor, b_idx_tensor).item()
-        
+        true_root_tensor, _ = unifier.update_ref(node_tensor, b_idx_tensor)
+        true_idx = true_root_tensor.item()
         
         if true_idx in visited:
             return "[CYCLE DETECTED]"
         visited.add(true_idx)
         
         if unifier.is_var_mask[true_idx]:
-            # 1. Try to find the original human-assigned name (e.g., 'X', 'Y')
             idx_to_name = {int(v): k for k, v in var_name_map.items()}
             if true_idx in idx_to_name:
                 return idx_to_name[true_idx]
                 
-            
             var_letters = ['X', 'Y', 'Z', 'V', 'W', 'U']
             assigned_letter = var_letters[true_idx % len(var_letters)]
-            
             return f"{assigned_letter}_{true_idx}"
             
         sym_id = unifier.nodes[true_idx].item()
@@ -521,7 +538,20 @@ class ProverPipeline:
         if len(valid_children) == 0:
             return sym_str
         else:
-            args = [self.decode_term(c.item(), unifier, id_to_symbol, var_name_map, visited.copy()) for c in valid_children]
+            # --- THE FIX ---
+            # Explicitly pass batch_index and visited as clear keywords. 
+            # This makes the positional order completely safe!
+            args = [
+                self.decode_term(
+                    c.item(), 
+                    unifier, 
+                    id_to_symbol, 
+                    var_name_map, 
+                    batch_index=batch_index, 
+                    visited=visited.copy()
+                ) 
+                for c in valid_children
+            ]
             return f"{sym_str}({', '.join(args)})"
         
     def print_report(self, string_pairs, subs, success_mask, unifier):
@@ -552,7 +582,7 @@ class ProverPipeline:
                 else:
                     print("   -> Bindings:")
                     for var_name, var_memory_idx in combined_var_map.items():
-                        bound_string = self.decode_term(var_memory_idx, unifier, id_to_symbol, combined_var_map)
+                        bound_string = self.decode_term(var_memory_idx, unifier, id_to_symbol, combined_var_map, i)
                         # Hide trivial self-bindings (e.g., Y = Y)
                         if bound_string != var_name:
                             print(f"      {var_name} = {bound_string}")
