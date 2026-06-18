@@ -108,7 +108,9 @@ class BatchedGPUUnifier:
             left, right = left[active], right[active]
             batch_idx = batch_idx[active] 
             
-            if left.shape[0] == 0: break
+            if left.shape[0] == 0: 
+                frontier = torch.empty((0, 2), dtype=torch.long, device=self.nodes.device)
+                break
             
             l_is_v = self.is_var_mask[left]
             r_is_v = self.is_var_mask[right]
@@ -153,6 +155,10 @@ class BatchedGPUUnifier:
                         success_mask[b_idx_all[failed_occurs]] = False
                     survivors = ~failed_occurs
                     v_idx, t_idx, b_idx_all = v_idx[survivors], t_idx[survivors], b_idx_all[survivors]
+                
+                if v_idx.shape[0] == 0 and len(next_frontier_pieces) == 0:
+                    frontier = torch.empty((0, 2), dtype=torch.long, device=self.nodes.device)
+                    break
                 
                 if v_idx.shape[0] > 0:
                     # Let the gpu race
@@ -530,7 +536,7 @@ class ProverPipeline:
         node_tensor = torch.tensor([idx_int], dtype=torch.long, device=self.device)
         b_idx_tensor = torch.tensor([batch_index], dtype=torch.long, device=self.device) 
         
-        true_root_tensor = unifier.update_ref(node_tensor, b_idx_tensor)
+        true_root_tensor = unifier.subs[batch_index, idx_int]
         true_idx = true_root_tensor.item()
         
         if true_idx in visited:
