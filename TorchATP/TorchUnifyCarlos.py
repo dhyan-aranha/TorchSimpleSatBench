@@ -126,9 +126,8 @@ class BatchedGPUUnifier:
                 t_idx = torch.where(v_l_is_v, v_right, v_left)
                 b_idx_all = batch_idx[is_var_pair]
                 
-                # ---- THE SLOW MODE FIX ----
+                
                 if not fast_mode:
-                    # SLOW MODE: Restrict to ONE variable per batch per wave to catch mutual cycles.
                     # We defer all other variables in the same batch to the next wave.
                     unique_b, inverse_indices = torch.unique(b_idx_all, return_inverse=True)
                     idx_seq = torch.arange(len(b_idx_all), device=self.nodes.device)
@@ -143,12 +142,12 @@ class BatchedGPUUnifier:
                         next_frontier_pieces.append(torch.stack([v_left[deferred_mask], v_right[deferred_mask]], dim=1))
                         next_batch_pieces.append(b_idx_all[deferred_mask])
                         
-                    # Filter down to just the single winning variable
+                    # Only take one variable per batch to bind
                     v_idx = v_idx[first_occ_idx]
                     t_idx = t_idx[first_occ_idx]
                     b_idx_all = b_idx_all[first_occ_idx]
                 
-                    # Now run the rigorous occurs check
+                    # Now do occurs check
                     failed_occurs = self.occurs_check(v_idx, t_idx, b_idx_all)
                     if torch.any(failed_occurs):
                         success_mask[b_idx_all[failed_occurs]] = False
@@ -556,9 +555,6 @@ class ProverPipeline:
         if len(valid_children) == 0:
             return sym_str
         else:
-            # --- THE FIX ---
-            # Explicitly pass batch_index and visited as clear keywords. 
-            # This makes the positional order completely safe!
             args = [
                 self.decode_term(
                     c.item(), 

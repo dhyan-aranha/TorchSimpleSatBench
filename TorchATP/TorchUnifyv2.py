@@ -111,6 +111,108 @@ class BatchedGPUUnifier:
 
         return failed_occurs
 
+    def optimistic_bind_and_validate(self, v_idx, t_idx, b_idx_all):
+        """
+        Executes a lock-free parallel write and catches hardware collisions 
+        and simultaneous cross-dependencies (like the Pair 6 trap).
+        Returns: (deferred_v, deferred_t, deferred_b) for the next wave.
+        """
+        device = self.nodes.device
+        num_pairs = self.subs.shape[0]
+        
+        # ---------------------------------------------------------
+        # PHASE 1: The Optimistic Hardware Race
+        # ---------------------------------------------------------
+        # Every thread writes blindly at the exact same time
+        self.subs[b_idx_all, v_idx] = t_idx
+        
+        # Read back the memory to see who actually won the physical write
+        won_targets = self.subs[b_idx_all, v_idx]
+        lost_the_race_mask = (won_targets != t_idx)
+        
+        # ---------------------------------------------------------
+        # PHASE 2: Track the Winners
+        # ---------------------------------------------------------
+        # Isolate the threads that successfully committed their binding
+        winners_b = b_idx_all[~lost_the_race_mask]
+        winners_v = v_idx[~lost_the_race_mask]
+        winners_t = t_idx[~lost_the_race_mask]
+        
+        # Build a global map of exactly which variables bound a value THIS wave
+        was_bound_this_wave = torch.zeros(
+            (num_pairs, self.num_nodes), dtype=torch.bool, device=device
+        )
+        if len(winners_b) > 0:
+            was_bound_this_wave[winners_b, winners_v] = True
+        
+        # ---------------------------------------------------------
+        # PHASE 3: The Cross-Dependency Validation Pass (BFS)
+        # ---------------------------------------------------------
+        # We only need to check the target terms of the WINNERS.
+        K_winners = len(winners_t)
+        cross_cycle_mask = torch.zeros(K_winners, dtype=torch.bool, device=device)
+        
+        if K_winners > 0:
+            frontier = winners_t.unsqueeze(1)
+            b_idx_expanded = winners_b.unsqueeze(1)
+            step_counter = 0
+            
+            while frontier.shape[1] > 0:
+                # Circuit breaker just in case a true infinite loop slipped in
+                if step_counter > 10: 
+                    active_rows = (frontier != -1).any(dim=1)
+                    cross_cycle_mask |= active_rows
+                    break
+                
+                valid_mask = (frontier != -1)
+                safe_frontier = frontier.clone()
+                safe_frontier[~valid_mask] = 0 # Safe padding for indexing
+                
+                # CRITICAL CHECK: Does this frontier node equal a variable 
+                # that ALSO bound a value during this exact same wave?
+                simultaneous_bind = was_bound_this_wave[
+                    b_idx_expanded.expand(-1, frontier.shape[1]), 
+                    safe_frontier
+                ]
+                simultaneous_bind[~valid_mask] = False 
+                
+                # If any node in a row flags True, that specific write is trapped in a cycle
+                new_fails = simultaneous_bind.any(dim=1)
+                cross_cycle_mask |= new_fails
+                
+                # Step down to children for the next BFS wave
+                next_frontier = self.children[safe_frontier]
+                next_frontier[~valid_mask.unsqueeze(-1).expand_as(next_frontier)] = -1
+                
+                frontier = next_frontier.view(K_winners, -1)
+                
+                # Matrix squeezer to keep the BFS tight
+                col_has_data = (frontier != -1).any(dim=0)
+                frontier = frontier[:, col_has_data]
+                step_counter += 1
+
+        # ---------------------------------------------------------
+        # PHASE 4: Rollback & Deferral Compilation
+        # ---------------------------------------------------------
+        # Map the cross_cycle failures back to the original batch size array
+        final_cross_mask = torch.zeros(len(b_idx_all), dtype=torch.bool, device=device)
+        final_cross_mask[~lost_the_race_mask] = cross_cycle_mask
+        
+        # 1. Roll back the variables that fell into a cross-dependency trap
+        v_to_wipe = v_idx[final_cross_mask]
+        b_to_wipe = b_idx_all[final_cross_mask]
+        self.subs[b_to_wipe, v_to_wipe] = v_to_wipe # Restores them to "unbound"
+        
+        # 2. Compile everyone who needs to try again on the next wave
+        # (Hardware race losers + Cross-cycle rolled-back variables)
+        defer_mask = lost_the_race_mask | final_cross_mask
+        
+        deferred_v = v_idx[defer_mask]
+        deferred_t = t_idx[defer_mask]
+        deferred_b = b_idx_all[defer_mask]
+        
+        return deferred_v, deferred_t, deferred_b
+
     def unify(self, pair_batch):
         """
         Iterative, batched unification loop.
@@ -134,7 +236,6 @@ class BatchedGPUUnifier:
             
             if frontier.shape[0] == 0: break
             
-            
             left, l_cycles = self.update_ref(frontier[:, 0], batch_idx)
             right, r_cycles = self.update_ref(frontier[:, 1], batch_idx)
             
@@ -154,7 +255,6 @@ class BatchedGPUUnifier:
             next_frontier_pieces = []
             next_batch_pieces = []
             
-            
             is_var_pair = l_is_v | r_is_v
             
             if torch.any(is_var_pair):
@@ -166,7 +266,7 @@ class BatchedGPUUnifier:
                 t_idx = torch.where(v_l_is_v, v_right, v_left)
                 b_idx_all = batch_idx[is_var_pair]
                 
-                # 1. Pre-Binding Occurs Check (Safely blocks infinite structures)
+                # 1. Pre-Binding Occurs Check (Safely blocks vertical cycles like X -> f(X))
                 failed_occurs = self.occurs_check(v_idx, t_idx, b_idx_all)
                 
                 if torch.any(failed_occurs):
@@ -178,21 +278,13 @@ class BatchedGPUUnifier:
                 s_b = b_idx_all[survivors]
                 
                 if s_v.shape[0] > 0:
-                    # 2. The Optimistic Scatter Race (No torch.unique!)
-                    self.subs[s_b, s_v] = s_t
+                    # 2 & 3. The Optimistic Race, Tie-Breaker, and Cross-Cycle Check
+                    def_v, def_t, def_b = self.optimistic_bind_and_validate(s_v, s_t, s_b)
                     
-                    # 3. Read back to detect same-variable collisions
-                    won_targets = self.subs[s_b, s_v]
-                    conflict_mask = (won_targets != s_t)
-                    
-                    if torch.any(conflict_mask):
-                        c_left = won_targets[conflict_mask]
-                        c_right = s_t[conflict_mask]
-                        c_batch = s_b[conflict_mask]
-                        
-                        # Put the loser of the race back on the frontier for the next wave
-                        next_frontier_pieces.append(torch.stack([c_left, c_right], dim=1))
-                        next_batch_pieces.append(c_batch)
+                    if def_v.shape[0] > 0:
+                        # Put the deferred assignments back on the frontier for the next wave
+                        next_frontier_pieces.append(torch.stack([def_v, def_t], dim=1))
+                        next_batch_pieces.append(def_b)
                 
             fun_mask = ~is_var_pair
             if torch.any(fun_mask):
@@ -368,12 +460,9 @@ class ProverPipeline:
             ephemeral_is_var = torch.cat(out_is_var)
             ephemeral_children = torch.cat(out_children)
             
-            
             return old_to_new[root_keys], ephemeral_nodes, ephemeral_is_var, ephemeral_children
             
         return old_to_new[root_keys], None, None, None
-
-    
 
     def batched_instantiate_in_arena(self, batched_requests, unifier):
         """
@@ -389,7 +478,6 @@ class ProverPipeline:
         
         original_b_idx = batched_requests[:, 0]
         roots_old = batched_requests[:, 1]
-        
         
         # Compress the true batch IDs into dense local coordinates [0, 1, 2...]
         # This ensures all literals from the same batch share the same memoization layer.
@@ -486,14 +574,12 @@ class ProverPipeline:
             
         idx_int = int(idx) if isinstance(idx, torch.Tensor) else int(idx)
         
-        
         node_tensor = torch.tensor([idx_int], dtype=torch.long, device=self.device)
         b_idx_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
         
         # Safely unpack the tuple, then extract the scalar item
         true_root_tensor, _ = unifier.update_ref(node_tensor, b_idx_tensor)
         true_idx = true_root_tensor.item()
-        
         
         if true_idx in visited:
             return "[CYCLE DETECTED]"
@@ -505,7 +591,6 @@ class ProverPipeline:
             if true_idx in idx_to_name:
                 return idx_to_name[true_idx]
                 
-            
             var_letters = ['X', 'Y', 'Z', 'V', 'W', 'U']
             assigned_letter = var_letters[true_idx % len(var_letters)]
             
