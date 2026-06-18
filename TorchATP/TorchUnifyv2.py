@@ -120,9 +120,6 @@ class BatchedGPUUnifier:
         device = self.nodes.device
         num_pairs = self.subs.shape[0]
         
-        # ---------------------------------------------------------
-        # PHASE 1: The Optimistic Hardware Race
-        # ---------------------------------------------------------
         # Every thread writes blindly at the exact same time
         self.subs[b_idx_all, v_idx] = t_idx
         
@@ -130,9 +127,6 @@ class BatchedGPUUnifier:
         won_targets = self.subs[b_idx_all, v_idx]
         lost_the_race_mask = (won_targets != t_idx)
         
-        # ---------------------------------------------------------
-        # PHASE 2: Track the Winners
-        # ---------------------------------------------------------
         # Isolate the threads that successfully committed their binding
         winners_b = b_idx_all[~lost_the_race_mask]
         winners_v = v_idx[~lost_the_race_mask]
@@ -145,9 +139,6 @@ class BatchedGPUUnifier:
         if len(winners_b) > 0:
             was_bound_this_wave[winners_b, winners_v] = True
         
-        # ---------------------------------------------------------
-        # PHASE 3: The Cross-Dependency Validation Pass (BFS)
-        # ---------------------------------------------------------
         # We only need to check the target terms of the WINNERS.
         K_winners = len(winners_t)
         cross_cycle_mask = torch.zeros(K_winners, dtype=torch.bool, device=device)
@@ -168,13 +159,18 @@ class BatchedGPUUnifier:
                 safe_frontier = frontier.clone()
                 safe_frontier[~valid_mask] = 0 # Safe padding for indexing
                 
-                # CRITICAL CHECK: Does this frontier node equal a variable 
-                # that ALSO bound a value during this exact same wave?
                 simultaneous_bind = was_bound_this_wave[
                     b_idx_expanded.expand(-1, frontier.shape[1]), 
                     safe_frontier
                 ]
                 simultaneous_bind[~valid_mask] = False 
+                
+                # --- THE FIX: THE DETERMINISTIC TIE-BREAKER ---
+                # Only flag a failure if the conflicting variable has a LOWER ID than ours.
+                # This breaks the symmetry: the higher ID rolls back and defers, 
+                # while the lower ID stays safely committed to memory.
+                tie_breaker_mask = safe_frontier < winners_v.unsqueeze(1)
+                simultaneous_bind = simultaneous_bind & tie_breaker_mask
                 
                 # If any node in a row flags True, that specific write is trapped in a cycle
                 new_fails = simultaneous_bind.any(dim=1)
